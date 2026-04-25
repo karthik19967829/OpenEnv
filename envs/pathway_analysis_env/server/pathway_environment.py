@@ -16,17 +16,22 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openenv.core.env_server import Environment
 
 from ..models import PathwayAction, PathwayObservation, PathwayState
+from . import failure_codes as FC
 from .analysis import (
     build_sample_metadata,
     compare_pathways_detail,
     counts_dict_to_samples_by_genes,
     filter_counts_by_minimum_total,
+    gseapy_available,
+    load_counts_csv_as_samples_by_genes,
+    load_author_de_table_csv,
     merge_analysis_options,
+    enrichr_ora,
     ora_fisher,
     overlap_genes_across_top_pathways,
     pick_de_query_genes,
@@ -94,6 +99,15 @@ td,th{{border:1px solid #ccc;padding:0.4rem;vertical-align:top;}} pre{{white-spa
     return str(path)
 
 
+def _safe_case_id(case: Dict[str, Any]) -> str:
+    """Best-effort case identifier for trace rendering."""
+    try:
+        cid = case.get("case_id")
+    except Exception:
+        cid = None
+    return str(cid or "unknown_case")
+
+
 class PathwayEnvironment(Environment):
     """
     Pathway inference with optional **pipeline Mode A** (counts + metadata in JSON),
@@ -125,7 +139,15 @@ class PathwayEnvironment(Environment):
         self._case = load_case(self._case_file)
         eid = episode_id or str(uuid.uuid4())
         strict = bool(kwargs.get("strict", self._case.get("strict_mode", False)))
-        pipeline = "counts" in self._case and "sample_ids" in self._case
+        pipeline = (
+            (
+                "counts" in self._case
+                or "counts_file" in self._case
+                or "de_table_file" in self._case
+            )
+            and "sample_ids" in self._case
+            and "sample_metadata" in self._case
+        )
         self._de_rows = []
         self._ora_rows = []
         self._query_genes = []
@@ -142,27 +164,45 @@ class PathwayEnvironment(Environment):
             expert_calls_used=0,
             legacy_mode=not pipeline,
         )
+        mode = "legacy"
+        if pipeline:
+            if "de_table_file" in self._case:
+                mode = "author_de_table"
+            elif "counts_file" in self._case or "counts" in self._case:
+                mode = "counts_matrix"
+            else:
+                mode = "pipeline_unknown"
         msg = (
-            "Dataset loaded (pipeline Mode A: counts + metadata)."
-            if pipeline
-            else "Toy dataset loaded (legacy static lists)."
+            "Dataset loaded (pipeline: counts/metadata)."
+            if mode == "counts_matrix"
+            else (
+                "Dataset loaded (pipeline: author DE table; enrichment only, not DESeq2-from-counts)."
+                if mode == "author_de_table"
+                else "Toy dataset loaded (legacy static lists)."
+            )
         )
         self._trace(
             "reset",
             {
                 "case_id": self._case.get("case_id"),
                 "pipeline": pipeline,
+                "mode": mode,
                 "strict": strict,
             },
             msg,
         )
         trace_path = _write_html_trace(
-            eid, self._trace_steps, str(self._case.get("case_id", ""))
+            eid, self._trace_steps, _safe_case_id(self._case)
         )
         return PathwayObservation(
-            message=msg + " Inspect, run DE, enrichment, compare pathways, or submit.",
+            message=msg
+            + " Use understand_experiment_design, inspect, run DE, enrichment, compare, or submit.",
             available_conditions=self._state.conditions,
-            metadata={"case_id": self._case["case_id"], "pipeline_mode": pipeline},
+            metadata={
+                "case_id": self._case["case_id"],
+                "pipeline_mode": pipeline,
+                "pipeline_data_mode": mode,
+            },
             trace_path=trace_path,
         )
 
@@ -180,18 +220,28 @@ class PathwayEnvironment(Environment):
     def _refresh_trace_file(self) -> str:
         eid = self._state.episode_id or "unknown"
         return _write_html_trace(
-            eid, self._trace_steps, str(self._case.get("case_id", ""))
+            eid, self._trace_steps, _safe_case_id(self._case)
         )
 
-    def _fail_strict(self, reason: str) -> PathwayObservation:
+    def _fail_strict(
+        self, reason: str, failure_code: str = FC.STRICT_TERMINATION
+    ) -> PathwayObservation:
         self._state.is_done = True
-        self._trace("strict_failure", {"reason": reason}, reason)
+        self._trace(
+            "strict_failure",
+            {"reason": reason, "failure_code": failure_code},
+            reason,
+        )
         tp = self._refresh_trace_file()
         return PathwayObservation(
             message=reason,
             done=True,
             reward=-3.0,
-            metadata={"strict_failure": True, "reason": reason},
+            metadata={
+                "strict_failure": True,
+                "reason": reason,
+                "failure_code": failure_code,
+            },
             trace_path=tp,
         )
 
@@ -208,7 +258,11 @@ class PathwayEnvironment(Environment):
                 message="Episode already finished; call reset() for a new episode.",
                 done=True,
                 reward=0.0,
-                metadata={"error": "episode_done", "step_count": s.step_count},
+                metadata={
+                    "error": "episode_done",
+                    "failure_code": FC.EPISODE_ALREADY_DONE,
+                    "step_count": s.step_count,
+                },
             )
             obs.trace_path = self._refresh_trace_file()
             return obs
@@ -233,6 +287,9 @@ class PathwayEnvironment(Environment):
             obs.trace_path = self._refresh_trace_file()
             return obs
 
+        if action.action_type == "understand_experiment_design":
+            return self._step_understand_experiment_design(action)
+
         if action.action_type == "run_differential_expression":
             return self._step_de(action)
 
@@ -251,10 +308,191 @@ class PathwayEnvironment(Environment):
         obs = PathwayObservation(
             message=f"Unknown action_type: {action.action_type}",
             reward=-0.2,
-            metadata={"step_count": s.step_count},
+            metadata={
+                "step_count": s.step_count,
+                "failure_code": FC.UNKNOWN_ACTION_TYPE,
+                "action_type": action.action_type,
+            },
         )
         obs.trace_path = self._refresh_trace_file()
         return obs
+
+    def _experiment_design_dict(self) -> Dict[str, Any]:
+        case = self._case
+        s = self._state
+        sample_ids = list(case.get("sample_ids") or [])
+        smd = case.get("sample_metadata") or {}
+        per: Dict[str, int] = {}
+        for sid in sample_ids:
+            c = smd.get(sid)
+            if c is not None:
+                per[c] = per.get(c, 0) + 1
+        conds = list(s.conditions)
+        return {
+            "case_id": case.get("case_id"),
+            "pipeline_mode": s.pipeline_mode,
+            "conditions": conds,
+            "n_groups": len(conds),
+            "n_samples": len(sample_ids),
+            "samples_per_condition": per,
+            "sample_ids": sample_ids,
+            "default_contrast": case.get("default_contrast"),
+            "experiment_metadata": case.get("experiment_metadata"),
+            "agent_workflow": (
+                "(1) Groups: use conditions + samples_per_condition to see how many groups and "
+                "replicates exist. (2) DGE: pick reference vs alternate for DESeq2 "
+                "(validate via understand_experiment_design or pass to run_differential_expression). "
+                "(3) Pathways: run_pathway_enrichment then compare/submit."
+            ),
+            "design_note": (
+                "Reference = baseline (denominator of log2 fold change); alternate = comparison arm "
+                "for DGE. Optionally set condition_a / condition_b here to validate before "
+                "run_differential_expression."
+            ),
+        }
+
+    def _validate_contrast_proposal(
+        self, ref: str, alt: str
+    ) -> Optional[Tuple[str, str]]:
+        """Return (error_message, failure_code) if invalid; None if valid for DESeq2."""
+        conds = set(self._state.conditions)
+        if ref not in conds or alt not in conds:
+            return (
+                "Reference and alternate must be among the case `conditions`.",
+                FC.DESIGN_INVALID_CONTRAST_NAMES,
+            )
+        if ref == alt:
+            return (
+                "Reference and alternate must be two different conditions.",
+                FC.DESIGN_INVALID_CONTRAST_NAMES,
+            )
+        sample_ids = list(self._case.get("sample_ids") or [])
+        smd = self._case.get("sample_metadata") or {}
+        if not sample_ids:
+            return None
+        per: Dict[str, int] = {}
+        for sid in sample_ids:
+            c = smd.get(sid)
+            if c is not None:
+                per[c] = per.get(c, 0) + 1
+        if per.get(ref, 0) < 1 or per.get(alt, 0) < 1:
+            return (
+                "Each contrast arm must have at least one sample in `sample_metadata`.",
+                FC.DESIGN_INSUFFICIENT_SAMPLES_PER_ARM,
+            )
+        return None
+
+    def _step_understand_experiment_design(
+        self, action: PathwayAction
+    ) -> PathwayObservation:
+        s = self._state
+        design = self._experiment_design_dict()
+        ref_in = (action.condition_a or "").strip()
+        alt_in = (action.condition_b or "").strip()
+        has_both = bool(ref_in and alt_in)
+        has_partial = bool(ref_in or alt_in) and not has_both
+
+        if has_partial:
+            obs = PathwayObservation(
+                message=(
+                    "Provide both reference (condition_a) and alternate (condition_b) to "
+                    "validate a contrast, or leave both empty for a design summary only."
+                ),
+                available_conditions=s.conditions,
+                experiment_design=design,
+                reward=-0.02,
+                metadata={
+                    "step_count": s.step_count,
+                    "validation": "incomplete",
+                    "failure_code": FC.DESIGN_PARTIAL_CONTRAST,
+                },
+            )
+            self._trace(
+                "understand_experiment_design",
+                {"validation": "incomplete"},
+                obs.message,
+            )
+            obs.trace_path = self._refresh_trace_file()
+            return obs
+
+        if not has_both:
+            s.design_understood = True
+            msg = (
+                "Design summary: you have the groups (conditions) and sample counts per group. "
+                "Next, choose reference vs alternate for DGE (differential expression), then pathway "
+                "steps. Re-run this action with both conditions set to validate your contrast."
+            )
+            obs = PathwayObservation(
+                message=msg,
+                available_conditions=s.conditions,
+                experiment_design=design,
+                reward=0.05,
+                metadata={"step_count": s.step_count, "validation": "summary_only"},
+            )
+            self._trace("understand_experiment_design", {"mode": "summary"}, msg)
+            obs.trace_path = self._refresh_trace_file()
+            return obs
+
+        invalid = self._validate_contrast_proposal(ref_in, alt_in)
+        if invalid:
+            err, fcode = invalid
+            s.validated_reference = None
+            s.validated_alternate = None
+            s.design_understood = True
+            obs = PathwayObservation(
+                message=err,
+                available_conditions=s.conditions,
+                experiment_design=design,
+                reward=-0.05,
+                metadata={
+                    "step_count": s.step_count,
+                    "validation": "invalid",
+                    "failure_code": fcode,
+                },
+            )
+            self._trace(
+                "understand_experiment_design",
+                {"validation": "invalid", "proposal": [ref_in, alt_in]},
+                err,
+            )
+            obs.trace_path = self._refresh_trace_file()
+            return obs
+
+        s.validated_reference = ref_in
+        s.validated_alternate = alt_in
+        s.design_understood = True
+        design["validated_contrast"] = {"reference": ref_in, "alternate": alt_in}
+        msg = (
+            f"DGE contrast chosen: reference=`{ref_in}`, alternate=`{alt_in}` "
+            f"({len(s.conditions)} groups in study). "
+            "run_differential_expression will use this pair when DE omits conditions; "
+            "explicit DE fields override. Then run pathway enrichment."
+        )
+        obs = PathwayObservation(
+            message=msg,
+            available_conditions=s.conditions,
+            experiment_design=design,
+            reward=0.08,
+            metadata={"step_count": s.step_count, "validation": "valid"},
+        )
+        self._trace(
+            "understand_experiment_design",
+            {"validation": "valid", "contrast": [ref_in, alt_in]},
+            msg,
+        )
+        obs.trace_path = self._refresh_trace_file()
+        return obs
+
+    def _resolve_de_contrast(
+        self, action: PathwayAction
+    ) -> tuple[Optional[str], Optional[str]]:
+        """DESeq2 contrast: explicit action fields beat validated design, then default_contrast."""
+        dc = self._case.get("default_contrast") or {}
+        ar = (action.condition_a or "").strip()
+        ab = (action.condition_b or "").strip()
+        ref = ar or self._state.validated_reference or dc.get("reference")
+        alt = ab or self._state.validated_alternate or dc.get("alternate")
+        return ref, alt
 
     def _step_de(self, action: PathwayAction) -> PathwayObservation:
         s = self._state
@@ -277,49 +515,106 @@ class PathwayEnvironment(Environment):
         if not pydeseq2_available():
             if s.strict_mode:
                 return self._fail_strict(
-                    "PyDESeq2 is not installed; strict mode terminates."
+                    "PyDESeq2 is not installed; strict mode terminates.",
+                    FC.DE_PYDESeq2_UNAVAILABLE,
                 )
             return PathwayObservation(
                 message="PyDESeq2 is not installed; cannot run DE on counts.",
                 reward=-0.5,
-                metadata={"error": "missing_pydeseq2"},
+                metadata={
+                    "error": "missing_pydeseq2",
+                    "failure_code": FC.DE_PYDESeq2_UNAVAILABLE,
+                },
             )
 
-        ref = action.condition_a or self._case.get("default_contrast", {}).get(
-            "reference"
-        )
-        alt = action.condition_b or self._case.get("default_contrast", {}).get(
-            "alternate"
-        )
+        ref, alt = self._resolve_de_contrast(action)
         if not ref or not alt:
             msg = "Specify condition_a (reference) and condition_b (alternate) for DESeq2."
             if s.strict_mode:
-                return self._fail_strict(msg)
+                return self._fail_strict(msg, FC.DE_MISSING_CONTRAST)
             return PathwayObservation(
-                message=msg, reward=-0.3, metadata={"error": "contrast"}
+                message=msg,
+                reward=-0.3,
+                metadata={"error": "contrast", "failure_code": FC.DE_MISSING_CONTRAST},
             )
 
-        counts = self._case["counts"]
         sample_ids = self._case["sample_ids"]
         smd = self._case["sample_metadata"]
-        v_err = validate_counts_case(self._case)
-        if v_err:
-            if s.strict_mode:
-                return self._fail_strict(v_err)
-            return PathwayObservation(
-                message=v_err, reward=-0.5, metadata={"error": "invalid_counts"}
-            )
-
         try:
-            counts_df = counts_dict_to_samples_by_genes(counts, sample_ids)
+            if "de_table_file" in self._case:
+                # Author-provided DE (no counts available). We treat this as a precomputed DE run.
+                opts = merge_analysis_options(self._case)
+                de_rows = load_author_de_table_csv(
+                    DATA_DIR / str(self._case["de_table_file"]),
+                    gene_column=str(self._case.get("de_table_gene_column") or "Gene,name"),
+                    log2fc_column=str(self._case.get("de_table_log2fc_column") or "log2FoldChange"),
+                    pvalue_column=str(self._case.get("de_table_pvalue_column") or "pvalue"),
+                    padj_column=str(self._case.get("de_table_padj_column") or "padj"),
+                )
+                padj_alpha = float(opts["padj_alpha"])
+                for r in de_rows:
+                    try:
+                        pv = float(r.get("padj"))
+                    except (TypeError, ValueError):
+                        pv = 1.0
+                    r["significant"] = bool(pv <= padj_alpha)
+                self._de_rows = de_rows
+                self._query_genes = pick_de_query_genes(
+                    de_rows,
+                    padj_alpha=padj_alpha,
+                    direction=str(opts["de_query_direction"]),
+                    min_abs_log2fc=float(opts["min_abs_log2fc"]),
+                )
+                self._universe_genes = []  # unknown without counts
+                s.de_run = True
+                top_names = [r["gene"] for r in de_rows[:50]]
+                self._trace(
+                    "de",
+                    {
+                        "precomputed": True,
+                        "source": "author_de_table",
+                        "contrast": [ref, alt],
+                        "n_sig": sum(1 for r in de_rows if r.get("significant")),
+                        "n_rows": len(de_rows),
+                    },
+                    "Differential expression loaded (author-provided table).",
+                )
+                obs = PathwayObservation(
+                    message="Differential expression loaded from author table.",
+                    top_genes=top_names,
+                    de_genes=self._de_rows,
+                    reward=0.25,
+                    metadata={
+                        "step_count": s.step_count,
+                        "precomputed": True,
+                        "source": "author_de_table",
+                    },
+                )
+                obs.trace_path = self._refresh_trace_file()
+                return obs
+
+            if "counts_file" in self._case:
+                counts_df = load_counts_csv_as_samples_by_genes(
+                    DATA_DIR / str(self._case["counts_file"]),
+                    sample_ids=sample_ids,
+                )
+            else:
+                counts = self._case["counts"]
+                v_err = validate_counts_case(self._case)
+                if v_err:
+                    raise ValueError(v_err)
+                counts_df = counts_dict_to_samples_by_genes(counts, sample_ids)
             meta_df = build_sample_metadata(sample_ids, smd)
         except ValueError as exc:
             if s.strict_mode:
-                return self._fail_strict(str(exc))
+                return self._fail_strict(str(exc), FC.DE_INVALID_COUNTS_MATRIX)
             return PathwayObservation(
                 message=str(exc),
                 reward=-0.5,
-                metadata={"error": "missing_sample_metadata"},
+                metadata={
+                    "error": "counts_or_metadata_invalid",
+                    "failure_code": FC.DE_INVALID_COUNTS_MATRIX,
+                },
             )
 
         opts = merge_analysis_options(self._case)
@@ -332,11 +627,14 @@ class PathwayEnvironment(Environment):
                 f"only {n_genes_filt} genes remain (need ≥5 for stable DESeq2)."
             )
             if s.strict_mode:
-                return self._fail_strict(msg)
+                return self._fail_strict(msg, FC.DE_TOO_FEW_GENES_AFTER_FILTER)
             return PathwayObservation(
                 message=msg,
                 reward=-0.5,
-                metadata={"error": "too_few_genes_after_filter"},
+                metadata={
+                    "error": "too_few_genes_after_filter",
+                    "failure_code": FC.DE_TOO_FEW_GENES_AFTER_FILTER,
+                },
             )
 
         rows, err = run_deseq2_contrast(
@@ -348,8 +646,12 @@ class PathwayEnvironment(Environment):
         )
         if err:
             if s.strict_mode:
-                return self._fail_strict(err)
-            return PathwayObservation(message=err, reward=-0.5, metadata={"error": err})
+                return self._fail_strict(err, FC.DE_DESEQ2_FAILED)
+            return PathwayObservation(
+                message=err,
+                reward=-0.5,
+                metadata={"error": err, "failure_code": FC.DE_DESEQ2_FAILED},
+            )
 
         self._universe_genes = list(counts_df.columns)
         self._de_rows = rows
@@ -399,7 +701,11 @@ class PathwayEnvironment(Environment):
         s = self._state
         if not self._de_rows and not s.legacy_mode:
             msg = "Run differential expression before enrichment."
-            return PathwayObservation(message=msg, reward=-0.2)
+            return PathwayObservation(
+                message=msg,
+                reward=-0.2,
+                metadata={"failure_code": FC.ORA_DE_PREREQUISITE},
+            )
 
         pathways = self._case.get("pathway_genes") or {}
         if s.legacy_mode:
@@ -435,11 +741,12 @@ class PathwayEnvironment(Environment):
             return obs
 
         opts = merge_analysis_options(self._case)
-        universe = (
-            self._universe_genes
-            if self._universe_genes
-            else list(self._case["counts"].keys())
-        )
+        universe = self._universe_genes
+        if not universe:
+            if "counts" in self._case:
+                universe = list(self._case["counts"].keys())
+            else:
+                universe = []
         query = action.gene_list if action.gene_list else self._query_genes
         if not query:
             query = pick_de_query_genes(
@@ -451,22 +758,56 @@ class PathwayEnvironment(Environment):
         if not query and self._de_rows:
             query = [r["gene"] for r in self._de_rows[:50]]
 
-        if not pathways:
-            msg = "Case has no pathway_genes; cannot run ORA."
-            if s.strict_mode:
-                return self._fail_strict(msg)
-            return PathwayObservation(
-                message=msg,
-                reward=-0.3,
-                metadata={"error": "no_pathways"},
+        enrichr_libs = self._case.get("enrichr_libraries")
+        if enrichr_libs:
+            if not gseapy_available():
+                msg = "gseapy not installed; cannot run Enrichr enrichment."
+                if s.strict_mode:
+                    return self._fail_strict(msg, FC.ORA_NO_PATHWAY_DEFINITIONS)
+                return PathwayObservation(
+                    message=msg,
+                    reward=-0.3,
+                    metadata={
+                        "error": "missing_gseapy",
+                        "failure_code": FC.ORA_NO_PATHWAY_DEFINITIONS,
+                    },
+                )
+            ora, err = enrichr_ora(
+                query,
+                libraries=list(enrichr_libs),
+                background=universe or None,
+                top_k=100,
             )
-
-        ora = ora_fisher(
-            query,
-            pathways,
-            universe,
-            min_pathway_genes=int(opts["ora_min_pathway_genes"]),
-        )
+            if err:
+                if s.strict_mode:
+                    return self._fail_strict(err, FC.ORA_NO_PATHWAY_DEFINITIONS)
+                return PathwayObservation(
+                    message=err,
+                    reward=-0.3,
+                    metadata={
+                        "error": "enrichr_failed",
+                        "failure_code": FC.ORA_NO_PATHWAY_DEFINITIONS,
+                    },
+                )
+        else:
+            if not pathways:
+                msg = "Case has no pathway_genes (and no enrichr_libraries); cannot run ORA."
+                if s.strict_mode:
+                    return self._fail_strict(msg, FC.ORA_NO_PATHWAY_DEFINITIONS)
+                return PathwayObservation(
+                    message=msg,
+                    reward=-0.3,
+                    metadata={
+                        "error": "no_pathways",
+                        "failure_code": FC.ORA_NO_PATHWAY_DEFINITIONS,
+                    },
+                )
+            ora = ora_fisher(
+                query,
+                pathways,
+                universe,
+                min_pathway_genes=int(opts["ora_min_pathway_genes"]),
+            )
         self._ora_rows = ora
         s.enrichment_run = True
         top_names = [r["pathway"] for r in ora[:20]]
@@ -497,7 +838,10 @@ class PathwayEnvironment(Environment):
             return PathwayObservation(
                 message="Provide pathway_a and pathway_b.",
                 reward=-0.1,
-                metadata={"error": "missing_names"},
+                metadata={
+                    "error": "missing_names",
+                    "failure_code": FC.COMPARE_MISSING_PATHWAY_NAMES,
+                },
             )
         pathways = self._case.get("pathway_genes") or {}
         if s.legacy_mode:
@@ -526,13 +870,19 @@ class PathwayEnvironment(Environment):
             return PathwayObservation(
                 message="Expert calls are disabled for this case.",
                 reward=-0.1,
-                metadata={"expert": "disabled"},
+                metadata={
+                    "expert": "disabled",
+                    "failure_code": FC.EXPERT_DISABLED,
+                },
             )
         if s.expert_calls_used >= budget:
             return PathwayObservation(
                 message="Expert call budget exhausted.",
                 reward=-0.5,
-                metadata={"expert": "exhausted"},
+                metadata={
+                    "expert": "exhausted",
+                    "failure_code": FC.EXPERT_BUDGET_EXHAUSTED,
+                },
             )
         s.expert_calls_used += 1
         penalty = float(self._case.get("expert_penalty", 0.3))
@@ -564,11 +914,14 @@ class PathwayEnvironment(Environment):
             {"hypothesis": action.hypothesis, "correct": correct},
             "Episode end",
         )
+        meta: Dict[str, Any] = {"correct": correct, "step_count": s.step_count}
+        if not correct:
+            meta["failure_code"] = FC.SUBMIT_INCORRECT_HYPOTHESIS
         obs = PathwayObservation(
             message="Answer submitted.",
             done=True,
             reward=2.0 if correct else -1.0,
-            metadata={"correct": correct, "step_count": s.step_count},
+            metadata=meta,
         )
         obs.trace_path = self._refresh_trace_file()
         return obs

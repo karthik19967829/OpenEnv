@@ -47,6 +47,15 @@ def test_load_pipeline_case():
     assert case["true_pathway"] == "MAPK signaling"
 
 
+def test_load_gse235417_case_is_pipeline_mode():
+    case = load_case("gse235417_case.json")
+    assert "counts_file" in case
+    assert "sample_ids" in case
+    assert "sample_metadata" in case
+    assert case["default_contrast"]["reference"] == "baseline"
+    assert case["default_contrast"]["alternate"] == "resistant"
+
+
 @requires_pydeseq2
 def test_deseq2_mapk_case():
     case = json.loads((DATA_DIR / "toy_case_001.json").read_text(encoding="utf-8"))
@@ -99,6 +108,51 @@ def test_build_sample_metadata_missing_sample():
         build_sample_metadata(["S1", "S2"], {"S1": "a"})
 
 
+def test_understand_experiment_design_summary():
+    env = PathwayEnvironment(case_file="toy_case_001.json")
+    env.reset()
+    obs = env.step(PathwayAction(action_type="understand_experiment_design"))
+    assert obs.experiment_design
+    assert obs.experiment_design.get("samples_per_condition")
+    assert env.state.design_understood is True
+    assert env.state.validated_reference is None
+
+
+@requires_pydeseq2
+def test_understand_validated_contrast_matches_explicit_de():
+    env = PathwayEnvironment(case_file="toy_case_001.json")
+    env.reset()
+    u = env.step(
+        PathwayAction(
+            action_type="understand_experiment_design",
+            condition_a="control",
+            condition_b="treated",
+        )
+    )
+    assert u.experiment_design and u.experiment_design.get("validated_contrast")
+    assert env.state.validated_reference == "control"
+    assert env.state.validated_alternate == "treated"
+    a = env.step(
+        PathwayAction(
+            action_type="run_differential_expression",
+            condition_a="control",
+            condition_b="treated",
+        )
+    )
+    env2 = PathwayEnvironment(case_file="toy_case_001.json")
+    env2.reset()
+    env2.step(
+        PathwayAction(
+            action_type="understand_experiment_design",
+            condition_a="control",
+            condition_b="treated",
+        )
+    )
+    b = env2.step(PathwayAction(action_type="run_differential_expression"))
+    assert a.de_genes and b.de_genes
+    assert [r.get("gene") for r in a.de_genes[:10]] == [r.get("gene") for r in b.de_genes[:10]]
+
+
 def test_no_step_after_episode_done():
     env = PathwayEnvironment(case_file="toy_case_legacy.json")
     env.reset()
@@ -106,6 +160,7 @@ def test_no_step_after_episode_done():
     late = env.step(PathwayAction(action_type="inspect_dataset"))
     assert late.done
     assert late.metadata.get("error") == "episode_done"
+    assert late.metadata.get("failure_code") == "episode_already_done"
 
 
 def test_overlap_summary():
@@ -193,6 +248,7 @@ def test_strict_invalid_counts_matrix():
         )
     )
     assert obs.done and obs.metadata.get("strict_failure") is True
+    assert obs.metadata.get("failure_code") == "de_invalid_counts_matrix"
 
 
 @requires_pydeseq2
@@ -202,3 +258,4 @@ def test_strict_mode_missing_contrast():
     obs = env.step(PathwayAction(action_type="run_differential_expression"))
     assert obs.done is True
     assert obs.metadata.get("strict_failure") is True
+    assert obs.metadata.get("failure_code") == "de_missing_contrast"

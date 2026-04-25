@@ -21,6 +21,7 @@ import pandas as pd
 from openenv.core.env_server.types import EnvironmentMetadata
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_OUTPUTS_DIR = Path(__file__).resolve().parent.parent / "outputs"
 
 
 def _list_case_files() -> List[str]:
@@ -28,6 +29,77 @@ def _list_case_files() -> List[str]:
         return ["toy_case_001.json"]
     names = sorted(p.name for p in _DATA_DIR.glob("*.json"))
     return names if names else ["toy_case_001.json"]
+
+
+def _list_saved_runs() -> List[str]:
+    """Folders under outputs/ that contain summary.json."""
+    if not _OUTPUTS_DIR.is_dir():
+        return []
+    runs = []
+    for p in sorted(_OUTPUTS_DIR.iterdir()):
+        if not p.is_dir():
+            continue
+        if (p / "summary.json").is_file():
+            runs.append(p.name)
+    return runs
+
+
+def _load_saved_run(run_name: str) -> Dict[str, Any]:
+    base = _OUTPUTS_DIR / run_name
+    out: Dict[str, Any] = {"run": run_name}
+    try:
+        out["summary"] = json.loads((base / "summary.json").read_text(encoding="utf-8"))
+    except Exception as e:
+        out["summary_error"] = str(e)
+        out["summary"] = {}
+    try:
+        out["de"] = json.loads((base / "de_top200.json").read_text(encoding="utf-8"))
+    except Exception as e:
+        out["de_error"] = str(e)
+        out["de"] = []
+    try:
+        out["enrichment"] = json.loads(
+            (base / "enrichment_top50.json").read_text(encoding="utf-8")
+        )
+    except Exception as e:
+        out["enrichment_error"] = str(e)
+        out["enrichment"] = []
+    return out
+
+
+def _saved_run_to_tables(run: Dict[str, Any]) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
+    s = run.get("summary") or {}
+    md_lines = [
+        f"**Run:** `{run.get('run','')}`",
+        f"**Case:** `{s.get('case_id','')}`",
+        f"**Contrast:** `{s.get('contrast')}`",
+        f"**Genes:** in matrix `{s.get('genes_in_matrix')}` → after prefilter `{s.get('genes_after_prefilter')}`",
+        f"**Trace:** `{s.get('trace_path','')}`",
+    ]
+    md = "\n\n".join(md_lines)
+
+    de = run.get("de") or []
+    df_de = pd.DataFrame(de) if isinstance(de, list) and de else pd.DataFrame({"info": ["No DE export found."]})
+
+    enr = run.get("enrichment") or []
+    if isinstance(enr, list) and enr:
+        df_enr = pd.DataFrame(
+            [
+                {
+                    "pathway": r.get("pathway"),
+                    "p_value": r.get("p_value"),
+                    "q_value": r.get("q_value"),
+                    "odds_ratio": r.get("odds_ratio"),
+                    "overlap_genes": ", ".join((r.get("overlap_genes") or [])[:40]),
+                }
+                for r in enr
+                if isinstance(r, dict)
+            ]
+        )
+    else:
+        df_enr = pd.DataFrame({"info": ["No enrichment export found."]})
+
+    return md, df_de, df_enr
 
 
 def _pathway_comparison_df(obs: Dict[str, Any]) -> pd.DataFrame:
@@ -83,10 +155,17 @@ def _state_markdown(st: Dict[str, Any]) -> str:
     done = "**Episode ended.** Reset to start over." if st.get("is_done") else ""
     conds = st.get("conditions") or []
     cond_line = ", ".join(f"`{c}`" for c in conds[:12]) if conds else "—"
+    vref = st.get("validated_reference")
+    valt = st.get("validated_alternate")
+    val_line = ""
+    if vref and valt:
+        val_line = f"\n\n**Validated contrast (for DE if fields empty):** `{vref}` → `{valt}`"
+    des = "✓" if st.get("design_understood") else "○"
     return (
         f"**Episode** {eid_short} · step **{st.get('step_count', 0)}** · {pipe} · {strict}\n\n"
         f"**Conditions in case:** {cond_line}\n\n"
-        f"**Pipeline:** DE {de_ok} · ORA {ora_ok} · **Expert calls** {expert}\n\n"
+        f"**Pipeline:** Design {des} · DE {de_ok} · ORA {ora_ok} · **Expert calls** {expert}"
+        f"{val_line}\n\n"
         f"{done}"
     ).strip()
 
@@ -109,6 +188,14 @@ def _observation_to_tables(
     ac = obs.get("available_conditions") or []
     if ac:
         lines.append("**Conditions (from last step):** " + ", ".join(f"`{c}`" for c in ac[:20]))
+
+    ed = obs.get("experiment_design")
+    if isinstance(ed, dict) and ed:
+        lines.append(
+            "**Experiment design (structured):**\n```json\n"
+            + json.dumps(ed, indent=2, default=str)[:8000]
+            + "\n```"
+        )
 
     md = "\n\n".join(lines)
 
@@ -236,6 +323,7 @@ def build_pathway_gradio_app(
     structured ``PathwayAction`` payloads.
     """
     case_choices = _list_case_files()
+    saved_runs = _list_saved_runs()
     display = metadata.name if metadata else title
 
     async def do_reset(case_file: str):
@@ -272,6 +360,20 @@ def build_pathway_gradio_app(
             data,
             web_manager,
             "Inspect complete.",
+            update_contrast=False,
+        )
+
+    async def step_understand(cond_a: str, cond_b: str):
+        payload: Dict[str, Any] = {
+            "action_type": "understand_experiment_design",
+            "condition_a": (cond_a or "").strip() or None,
+            "condition_b": (cond_b or "").strip() or None,
+        }
+        data = await web_manager.step_environment(payload)
+        return _response(
+            data,
+            web_manager,
+            "Understand experiment design complete.",
             update_contrast=False,
         )
 
@@ -343,8 +445,10 @@ def build_pathway_gradio_app(
     with gr.Blocks(title=f"{display} — Pathway lab") as blocks:
         gr.Markdown(
             f"# Pathway lab\n\n"
-            f"Interactive **inspect → DE → ORA → compare → submit** workflow for `{display}`. "
-            f"Use the **Playground** tab for the generic action form.\n\n"
+            f"**Agent-style flow:** **(1) Groups & design** — how many conditions and samples per group. "
+            f"**(2) DGE** — pick reference vs alternate, then differential expression. "
+            f"**(3) Pathways** — ORA, compare, submit hypothesis. "
+            f"Buttons: Understand design → Inspect → Run DE → Run ORA → … Use **Playground** for raw actions.\n\n"
             f"---"
         )
 
@@ -366,7 +470,8 @@ def build_pathway_gradio_app(
         gr.Markdown("### Contrast (PyDESeq2 pipeline cases)")
         gr.Markdown(
             "*Reference* = baseline condition, *alternate* = treatment. "
-            "Reset fills these from the case when possible; edit if needed."
+            "Reset fills these from the case when possible; edit if needed. "
+            "**Understand design:** leave both empty for a structured summary only, or fill both to validate the contrast (used by **Run DE** when those fields are left empty)."
         )
         with gr.Row():
             cond_ref = gr.Textbox(
@@ -382,6 +487,7 @@ def build_pathway_gradio_app(
 
         gr.Markdown("#### Workflow")
         with gr.Row():
+            btn_ud = gr.Button("0 · Understand design", variant="secondary")
             btn_ins = gr.Button("1 · Inspect", variant="secondary")
             btn_de = gr.Button("2 · Run DE", variant="primary")
             btn_ora = gr.Button("3 · Run ORA", variant="primary")
@@ -427,6 +533,20 @@ def build_pathway_gradio_app(
                     interactive=False,
                     wrap=True,
                 )
+            with gr.Tab("Saved run (GSE235417)"):
+                gr.Markdown(
+                    "Browse exported run artifacts under `envs/pathway_analysis_env/outputs/<run>/` "
+                    "(e.g. `gse235417`). This view does **not** re-run DESeq2; it only loads saved JSON."
+                )
+                run_dd = gr.Dropdown(
+                    choices=saved_runs,
+                    value="gse235417" if "gse235417" in saved_runs else (saved_runs[0] if saved_runs else None),
+                    label="Saved run folder (`outputs/`)",
+                )
+                load_btn = gr.Button("Load saved results", variant="primary")
+                run_md = gr.Markdown()
+                run_de = gr.Dataframe(label="Saved DE (top 200)", interactive=False, wrap=True)
+                run_enr = gr.Dataframe(label="Saved enrichment (top 50)", interactive=False, wrap=True)
             with gr.Tab("Overlap & ambiguity"):
                 out_extra = gr.Markdown()
             with gr.Tab("Trace"):
@@ -449,11 +569,19 @@ def build_pathway_gradio_app(
         ]
 
         reset_btn.click(fn=do_reset, inputs=[case_dd], outputs=ui_outputs)
+        btn_ud.click(fn=step_understand, inputs=[cond_ref, cond_alt], outputs=ui_outputs)
         btn_ins.click(fn=step_inspect, outputs=ui_outputs)
         btn_de.click(fn=step_de, inputs=[cond_ref, cond_alt], outputs=ui_outputs)
         btn_ora.click(fn=step_ora, outputs=ui_outputs)
         btn_cmp.click(fn=step_compare, inputs=[pw_a, pw_b], outputs=ui_outputs)
         btn_sub.click(fn=step_submit, inputs=[hyp], outputs=ui_outputs)
         btn_ex.click(fn=step_expert, inputs=[ex_q], outputs=ui_outputs)
+
+        def do_load_saved(run_name: str):
+            run = _load_saved_run(run_name or "")
+            md, df_de, df_enr = _saved_run_to_tables(run)
+            return md, df_de, df_enr
+
+        load_btn.click(fn=do_load_saved, inputs=[run_dd], outputs=[run_md, run_de, run_enr])
 
     return blocks
