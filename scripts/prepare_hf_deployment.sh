@@ -13,12 +13,15 @@ usage() {
 Usage: scripts/prepare_hf_deployment.sh [options]
 
 Environment selection:
-  --all                            Deploy all deployable envs under envs/ (default)
-  --env <name>                     Deploy a single env (repeatable)
+  --all                            Deploy all deployable envs under envs/ (default);
+                                   skips envs containing SKIP_HF_DEPLOYMENT
+  --env <name>                     Deploy a single env (repeatable); explicit
+                                   selection ignores SKIP_HF_DEPLOYMENT
 
 Deployment options:
   --base-sha <sha|tag>             openenv-base image ref suffix (default: latest)
   --hf-namespace <user|org>        HF namespace to deploy to (default: HF_NAMESPACE or openenv)
+  --repo-id <owner/repo>           Exact HF Space repo to update (single-env only)
   --space-suffix <suffix>          Suffix appended to each space name
                                    (default: -<openenv-version>, e.g. -0.2.1)
   --private                        Create/update spaces as private (default)
@@ -29,7 +32,7 @@ Deployment options:
 
 Version pinning:
   --openenv-version <ref>          Pin OpenEnv git refs to this tag/ref
-                                   (default: project version from pyproject.toml)
+                                   (default: latest vX.Y.Z release tag, else main)
 
 Collection update:
   --collection-namespace <owner>   Collection owner namespace (default: openenv)
@@ -89,12 +92,16 @@ fi
 BASE_IMAGE_SHA=""
 BASE_IMAGE_REF=""
 HF_NAMESPACE="${HF_NAMESPACE:-}"
+SPACE_REPO_OVERRIDE="${SPACE_REPO_OVERRIDE:-}"
 SPACE_SUFFIX="${SPACE_SUFFIX:-}"
 STAGING_DIR="hf-staging"
 HUB_TAG="openenv"
-DEFAULT_OPENENV_VERSION=$(awk -F'"' '/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ { print $2; exit }' pyproject.toml 2>/dev/null || true)
+# Latest stable release tag reachable from HEAD (vX.Y.Z -> X.Y.Z, skipping
+# pre-releases like vX.Y.Zrc1); the pyproject version on main is an untagged .devN.
+DEFAULT_OPENENV_VERSION=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*[!0-9.]*' 2>/dev/null || true)
+DEFAULT_OPENENV_VERSION="${DEFAULT_OPENENV_VERSION#v}"
 if [ -z "$DEFAULT_OPENENV_VERSION" ]; then
-    DEFAULT_OPENENV_VERSION="0.2.0"
+    DEFAULT_OPENENV_VERSION="main"
 fi
 OPENENV_VERSION="${OPENENV_VERSION:-$DEFAULT_OPENENV_VERSION}"
 OPENENV_GIT_REF="${OPENENV_GIT_REF:-}"
@@ -128,7 +135,7 @@ normalized_version_suffix() {
 
 resolve_openenv_git_ref() {
     local requested_ref="$1"
-    local repo_url="https://github.com/meta-pytorch/OpenEnv.git"
+    local repo_url="https://github.com/huggingface/OpenEnv.git"
     local candidate=""
     local resolved=""
 
@@ -150,7 +157,8 @@ resolve_openenv_git_ref() {
     fi
 
     for candidate in "$requested_ref" "v${requested_ref#v}"; do
-        resolved=$(git ls-remote --heads --tags "$repo_url" "$candidate" 2>/dev/null || true)
+        # Full ref names: a bare pattern also tail-matches branches like testpypi/0.8.0.
+        resolved=$(git ls-remote "$repo_url" "refs/tags/$candidate" "refs/heads/$candidate" 2>/dev/null || true)
         if [ -n "$resolved" ]; then
             printf "%s" "$candidate"
             return
@@ -178,6 +186,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --hf-namespace|--namespace|--hf-user|--hf-username)
             HF_NAMESPACE="$2"
+            shift 2
+            ;;
+        --repo-id|--space-repo)
+            SPACE_REPO_OVERRIDE="$2"
             shift 2
             ;;
         --space-suffix|--suffix)
@@ -258,6 +270,9 @@ if [ -z "$HF_NAMESPACE" ]; then
     # Non-fatal if user is not logged in locally.
     if command -v hf >/dev/null 2>&1; then
         HF_NAMESPACE=$(hf auth whoami 2>/dev/null | head -n 1 | tr -d '\n' || true)
+        if printf "%s" "$HF_NAMESPACE" | grep -q '^user='; then
+            HF_NAMESPACE=$(printf "%s" "$HF_NAMESPACE" | sed -E 's/^user=([^[:space:]]+).*/\1/')
+        fi
     fi
     if [ -z "$HF_NAMESPACE" ]; then
         HF_NAMESPACE="openenv"
@@ -265,9 +280,9 @@ if [ -z "$HF_NAMESPACE" ]; then
 fi
 
 if [ -n "$BASE_IMAGE_SHA" ]; then
-    BASE_IMAGE_REF="ghcr.io/meta-pytorch/openenv-base:$BASE_IMAGE_SHA"
+    BASE_IMAGE_REF="ghcr.io/huggingface/openenv-base:$BASE_IMAGE_SHA"
 else
-    BASE_IMAGE_REF="ghcr.io/meta-pytorch/openenv-base:latest"
+    BASE_IMAGE_REF="ghcr.io/huggingface/openenv-base:latest"
 fi
 
 if ! command -v hf >/dev/null 2>&1; then
@@ -301,7 +316,10 @@ resolve_env_dockerfile() {
 discover_all_envs() {
     local env_name=""
     while IFS= read -r env_name; do
-        if is_deployable_env "$env_name"; then
+        if [ -f "envs/$env_name/SKIP_HF_DEPLOYMENT" ]; then
+            SKIPPED_ENVS+=("$env_name")
+            warn "Skipping '$env_name' (SKIP_HF_DEPLOYMENT opts out of --all; use --env for explicit deployment)"
+        elif is_deployable_env "$env_name"; then
             SELECTED_ENVS+=("$env_name")
         else
             SKIPPED_ENVS+=("$env_name")
@@ -318,6 +336,15 @@ discover_all_envs() {
 
 if [ "$DEPLOY_ALL" = true ]; then
     discover_all_envs
+fi
+
+if [ -n "$SPACE_REPO_OVERRIDE" ]; then
+    if [ ${#SELECTED_ENVS[@]} -ne 1 ]; then
+        error "--repo-id requires exactly one selected environment"
+    fi
+    if ! printf "%s" "$SPACE_REPO_OVERRIDE" | grep -Eq '^[^/]+/[^/]+$'; then
+        error "Invalid --repo-id '$SPACE_REPO_OVERRIDE' (expected owner/repo)"
+    fi
 fi
 
 if [ ${#SELECTED_ENVS[@]} -eq 0 ]; then
@@ -349,13 +376,13 @@ pin_openenv_refs_in_pyproject() {
     # so release-candidate deployments test the requested OpenEnv ref instead
     # of silently resolving an older PyPI package.
     sed_inplace \
-        "/^[[:space:]]*\"/ s|git+https://github.com/meta-pytorch/OpenEnv.git@main|git+https://github.com/meta-pytorch/OpenEnv.git@$OPENENV_GIT_REF|g" \
+        "/^[[:space:]]*\"/ s|git+https://github.com/huggingface/OpenEnv.git@main|git+https://github.com/huggingface/OpenEnv.git@$OPENENV_GIT_REF|g" \
         "$file_path"
     sed_inplace \
-        "/^[[:space:]]*\"/ s|git+https://github.com/meta-pytorch/OpenEnv.git\"|git+https://github.com/meta-pytorch/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
+        "/^[[:space:]]*\"/ s|git+https://github.com/huggingface/OpenEnv.git\"|git+https://github.com/huggingface/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
         "$file_path"
     sed_inplace \
-        "/^[[:space:]]*\"/ s|\"openenv-core\\[core\\][^\"]*\"|\"openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
+        "/^[[:space:]]*\"/ s|\"openenv[<>=~! @][^\"]*\"|\"openenv @ git+https://github.com/huggingface/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
         "$file_path"
 }
 
@@ -375,6 +402,7 @@ strip_stage_artifacts() {
 create_environment_dockerfile() {
     local env_name="$1"
     local stage_dir="$2"
+    local space_repo="${3:-}"
     local dockerfile_path=""
     local prepare_script="envs/$env_name/server/prepare_hf.sh"
     local tmp_dockerfile="$stage_dir/Dockerfile.tmp"
@@ -397,16 +425,16 @@ create_environment_dockerfile() {
     fi
 
     sed_inplace \
-        "s|git+https://github.com/meta-pytorch/OpenEnv.git@main|git+https://github.com/meta-pytorch/OpenEnv.git@$OPENENV_GIT_REF|g" \
+        "s|git+https://github.com/huggingface/OpenEnv.git@main|git+https://github.com/huggingface/OpenEnv.git@$OPENENV_GIT_REF|g" \
         "$stage_dir/Dockerfile"
     sed_inplace \
-        "s|git+https://github.com/meta-pytorch/OpenEnv.git\"|git+https://github.com/meta-pytorch/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
+        "s|git+https://github.com/huggingface/OpenEnv.git\"|git+https://github.com/huggingface/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
         "$stage_dir/Dockerfile"
     sed_inplace \
-        "s|git+https://github.com/meta-pytorch/OpenEnv.git$|git+https://github.com/meta-pytorch/OpenEnv.git@$OPENENV_GIT_REF|g" \
+        "s|git+https://github.com/huggingface/OpenEnv.git$|git+https://github.com/huggingface/OpenEnv.git@$OPENENV_GIT_REF|g" \
         "$stage_dir/Dockerfile"
     sed_inplace \
-        "s|\"openenv-core\\[core\\][^\"]*\"|\"openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
+        "s|\"openenv[<>=~! @][^\"]*\"|\"openenv @ git+https://github.com/huggingface/OpenEnv.git@$OPENENV_GIT_REF\"|g" \
         "$stage_dir/Dockerfile"
 
     # Some base images include older uv versions that fail on a subset of env
@@ -458,10 +486,38 @@ create_environment_dockerfile() {
         fi
     fi
 
-    if ! grep -q '^ENV ENABLE_WEB_INTERFACE=' "$stage_dir/Dockerfile"; then
+    if grep -q '^ENV ENABLE_WEB_INTERFACE=' "$stage_dir/Dockerfile"; then
+        sed_inplace \
+            's/^ENV ENABLE_WEB_INTERFACE=.*/ENV ENABLE_WEB_INTERFACE=true/' \
+            "$stage_dir/Dockerfile"
+    else
         ensure_trailing_newline "$stage_dir/Dockerfile"
         echo "" >> "$stage_dir/Dockerfile"
         echo "ENV ENABLE_WEB_INTERFACE=true" >> "$stage_dir/Dockerfile"
+    fi
+
+    if [ "$env_name" = "textarena_env" ] && [ -n "$space_repo" ]; then
+        local repo_name="${space_repo##*/}"
+        local textarena_env_id=""
+        case "$repo_name" in
+            sudoku)
+                textarena_env_id="Sudoku-v0"
+                ;;
+            wordle)
+                textarena_env_id="Wordle-v0"
+                ;;
+        esac
+
+        if [ -n "$textarena_env_id" ]; then
+            if grep -q '^ENV TEXTARENA_ENV_ID=' "$stage_dir/Dockerfile"; then
+                sed_inplace \
+                    "s/^ENV TEXTARENA_ENV_ID=.*/ENV TEXTARENA_ENV_ID=$textarena_env_id/" \
+                    "$stage_dir/Dockerfile"
+            else
+                ensure_trailing_newline "$stage_dir/Dockerfile"
+                echo "ENV TEXTARENA_ENV_ID=$textarena_env_id" >> "$stage_dir/Dockerfile"
+            fi
+        fi
     fi
 }
 
@@ -559,46 +615,47 @@ ensure_readme_front_matter_tags() {
 create_readme() {
     local env_name="$1"
     local stage_dir="$2"
+    local space_repo="$3"
     local readme_source="envs/$env_name/README.md"
     local output_readme="$stage_dir/README.md"
-    local env_class="Env"
-
-    case "$env_name" in
-        echo_env) env_class="EchoEnv" ;;
-        coding_env) env_class="CodingEnv" ;;
-        chat_env) env_class="ChatEnv" ;;
-        atari_env) env_class="AtariEnv" ;;
-        openspiel_env) env_class="OpenSpielEnv" ;;
-    esac
+    # Client class: the first class in client.py that subclasses EnvClient or MCPToolClient.
+    local env_class
+    env_class=$(awk '/^class /{name=$2; sub(/[(:].*/,"",name); hdr=1} hdr && /(EnvClient|MCPToolClient)/{print name; exit} hdr && /:[[:space:]]*$/{hdr=0}' "envs/$env_name/client.py" 2>/dev/null)
+    # Space host: https://<owner>-<name>.hf.space, lowercased, with "/", "_" and "." replaced by "-".
+    local space_url
+    space_url="https://$(printf "%s" "$space_repo" | tr '[:upper:]' '[:lower:]' | tr '/_.' '---').hf.space"
 
     if head -n 1 "$readme_source" | grep -q '^---$'; then
-        local closing_line
-        closing_line=$(grep -n '^---$' "$readme_source" | sed -n '2p' | cut -d: -f1)
-
-        if [ -z "$closing_line" ]; then
-            error "Could not parse README front matter for $env_name"
-        fi
-
-        head -n "$closing_line" "$readme_source" > "$output_readme"
+        # The env's own text comes first: the web interface reads its first paragraph.
+        cat "$readme_source" > "$output_readme"
         cat >> "$output_readme" << README_EOF
 
 ## Hugging Face Space Deployment
 
 This Space is built from OpenEnv environment \`$env_name\`.
 
-- Space URL: \`https://huggingface.co/spaces/$HF_NAMESPACE/${env_name}${SPACE_SUFFIX}\`
+- Space URL: \`https://huggingface.co/spaces/$space_repo\`
 - OpenEnv pinned ref: \`$OPENENV_VERSION\`
 - Hub tag: \`$HUB_TAG\`
+README_EOF
+        # The snippet needs anonymous access, so private Spaces skip it.
+        if [ -n "$env_class" ] && [ "$PRIVATE" = false ]; then
+            cat >> "$output_readme" << README_EOF
 
 ### Connecting from Code
 
-\`\`\`python
-from envs.$env_name import $env_class
+\`\`\`bash
+pip install git+https://huggingface.co/spaces/$space_repo
+\`\`\`
 
-env = $env_class(base_url="https://huggingface.co/spaces/$HF_NAMESPACE/${env_name}${SPACE_SUFFIX}")
+\`\`\`python
+from $env_name import $env_class
+
+with $env_class(base_url="$space_url").sync() as env:
+    result = env.reset()
 \`\`\`
 README_EOF
-        tail -n "+$((closing_line + 1))" "$readme_source" >> "$output_readme"
+        fi
     else
         cat > "$output_readme" << README_EOF
 ---
@@ -613,7 +670,7 @@ tags:
 
 # ${env_name} Environment
 
-Space URL: \`https://huggingface.co/spaces/$HF_NAMESPACE/${env_name}${SPACE_SUFFIX}\`
+Space URL: \`https://huggingface.co/spaces/$space_repo\`
 
 OpenEnv pinned ref: \`$OPENENV_VERSION\`
 
@@ -637,6 +694,7 @@ README_EOF
 prepare_stage() {
     local env_name="$1"
     local stage_dir="$2"
+    local space_repo="$3"
 
     rm -rf "$stage_dir"
     mkdir -p "$stage_dir/envs"
@@ -671,14 +729,24 @@ prepare_stage() {
     pin_openenv_refs_in_pyproject "$stage_dir/pyproject.toml"
     pin_openenv_refs_in_pyproject "$stage_dir/envs/$env_name/pyproject.toml"
 
-    create_environment_dockerfile "$env_name" "$stage_dir"
-    create_readme "$env_name" "$stage_dir"
+    create_environment_dockerfile "$env_name" "$stage_dir" "$space_repo"
+    create_readme "$env_name" "$stage_dir" "$space_repo"
+}
+
+resolve_space_repo() {
+    local env_name="$1"
+    if [ -n "$SPACE_REPO_OVERRIDE" ]; then
+        printf "%s" "$SPACE_REPO_OVERRIDE"
+    else
+        printf "%s/%s%s" "$HF_NAMESPACE" "$env_name" "$SPACE_SUFFIX"
+    fi
 }
 
 deploy_env() {
     local env_name="$1"
-    local stage_dir="$STAGING_DIR/$HF_NAMESPACE/$env_name$SPACE_SUFFIX"
-    local space_repo="$HF_NAMESPACE/${env_name}${SPACE_SUFFIX}"
+    local space_repo
+    space_repo=$(resolve_space_repo "$env_name")
+    local stage_dir="$STAGING_DIR/$space_repo"
 
     if ! is_deployable_env "$env_name"; then
         warn "Skipping '$env_name' (missing Dockerfile or README.md)"
@@ -687,7 +755,7 @@ deploy_env() {
     fi
 
     log "Preparing $env_name (OpenEnv ref: $OPENENV_VERSION, base image: $BASE_IMAGE_REF)"
-    prepare_stage "$env_name" "$stage_dir" || return 1
+    prepare_stage "$env_name" "$stage_dir" "$space_repo" || return 1
 
     if [ "$DRY_RUN" = true ]; then
         log "[dry-run] Would create/update space: $space_repo"

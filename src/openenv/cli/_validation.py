@@ -1,8 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """
 Validation utilities for multi-mode deployment readiness.
@@ -11,6 +7,8 @@ This module provides functions to check if environments are properly
 configured for multi-mode deployment (Docker, direct Python, notebooks, clusters).
 """
 
+import ast
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -426,6 +424,84 @@ def validate_running_environment(
     return report
 
 
+def _has_main_guard_call(app_content: str) -> bool:
+    """Return True when the module calls main() under a __main__ guard."""
+    try:
+        tree = ast.parse(app_content)
+    except SyntaxError:
+        return (
+            "__name__" in app_content
+            and "__main__" in app_content
+            and "main(" in app_content
+        )
+
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.If) or not _is_main_guard(node.test):
+            continue
+
+        if any(_contains_main_call(guarded_node) for guarded_node in node.body):
+            return True
+
+    return False
+
+
+def _is_main_guard(test: ast.expr) -> bool:
+    """Return True for `if __name__ == "__main__"` tests."""
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
+    )
+
+
+def _contains_main_call(node: ast.AST) -> bool:
+    """Return True when an AST node contains a direct `main(...)` call."""
+    return any(
+        isinstance(candidate, ast.Call)
+        and isinstance(candidate.func, ast.Name)
+        and candidate.func.id == "main"
+        for candidate in ast.walk(node)
+    )
+
+
+_OPENENV_RUNTIME_DEP_RE = re.compile(r"^openenv(?:\s*(?:$|[<>=!~@;])|\[)")
+_LEGACY_OPENENV_CORE_DEP_RE = re.compile(r"^openenv-core(?:\s*(?:$|[<>=!~@;])|\[)")
+_OPENENV_DOCKER_INSTALL_RE = re.compile(
+    r"(?<![a-z0-9_.-])openenv(?:\s*(?:$|[<>=!~@;])|\[)"
+)
+
+
+def _dockerfile_installs_openenv_runtime(env_path: Path) -> bool:
+    """Return True when a Docker deployment installs OpenEnv outside pyproject."""
+    for dockerfile_path in (
+        env_path / "server" / "Dockerfile",
+        env_path / "Dockerfile",
+    ):
+        if not dockerfile_path.exists():
+            continue
+
+        try:
+            dockerfile = dockerfile_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        for line in dockerfile.splitlines():
+            stripped = line.strip().lower()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if _OPENENV_DOCKER_INSTALL_RE.search(stripped):
+                return True
+            if "openenv-core" in stripped:
+                return True
+
+    return False
+
+
 def validate_multi_mode_deployment(env_path: Path) -> tuple[bool, list[str]]:
     """
     Validate that an environment is ready for multi-mode deployment.
@@ -438,7 +514,8 @@ def validate_multi_mode_deployment(env_path: Path) -> tuple[bool, list[str]]:
     5. Required dependencies are present
 
     Returns:
-        Tuple of (is_valid, list of issues found)
+        `tuple` of `(is_valid, issues)` where `is_valid` is a `bool` and `issues` is a
+        `list` of issue strings found during validation.
     """
     issues = []
 
@@ -475,15 +552,12 @@ def validate_multi_mode_deployment(env_path: Path) -> tuple[bool, list[str]]:
 
     # Check required dependencies
     deps = [dep.lower() for dep in pyproject.get("project", {}).get("dependencies", [])]
-    has_openenv = any(
-        dep.startswith("openenv") and not dep.startswith("openenv-core") for dep in deps
-    )
-    has_legacy_core = any(dep.startswith("openenv-core") for dep in deps)
+    has_openenv = any(_OPENENV_RUNTIME_DEP_RE.match(dep) for dep in deps)
+    has_legacy_core = any(_LEGACY_OPENENV_CORE_DEP_RE.match(dep) for dep in deps)
+    has_dockerfile_core = _dockerfile_installs_openenv_runtime(env_path)
 
-    if not (has_openenv or has_legacy_core):
-        issues.append(
-            "Missing required dependency: openenv-core>=0.2.0 (or openenv>=0.2.0)"
-        )
+    if not (has_openenv or has_legacy_core or has_dockerfile_core):
+        issues.append("Missing required dependency: openenv>=0.2.0")
 
     # Check server/app.py exists
     server_app = env_path / "server" / "app.py"
@@ -496,7 +570,7 @@ def validate_multi_mode_deployment(env_path: Path) -> tuple[bool, list[str]]:
             issues.append("server/app.py missing main() function")
 
         # Check if main() is callable
-        if "__name__" not in app_content or "main()" not in app_content:
+        if not _has_main_guard_call(app_content):
             issues.append(
                 "server/app.py main() function not callable (missing if __name__ == '__main__')"
             )
@@ -509,7 +583,7 @@ def get_deployment_modes(env_path: Path) -> dict[str, bool]:
     Check which deployment modes are supported by the environment.
 
     Returns:
-        Dictionary with deployment mode names and whether they're supported
+        `dict` mapping deployment mode names to whether they are supported.
     """
     modes = {
         "docker": False,
@@ -538,7 +612,7 @@ def format_validation_report(env_name: str, is_valid: bool, issues: list[str]) -
     Format a validation report for display.
 
     Returns:
-        Formatted report string
+        `str`: formatted validation report.
     """
     if is_valid:
         return f"[OK] {env_name}: Ready for multi-mode deployment"

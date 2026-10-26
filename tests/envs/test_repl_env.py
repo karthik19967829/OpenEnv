@@ -1,12 +1,13 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Tests for the REPL Environment."""
 
+import importlib
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +38,50 @@ class TestPythonExecutor:
         result = executor.execute("print('hello world')")
         assert result["success"]
         assert "hello world" in result["stdout"]
+
+    def test_server_package_import_from_env_root(self, monkeypatch):
+        """Importing `server.repl_environment` from env root should work."""
+        env_root = Path(__file__).resolve().parents[2] / "envs" / "repl_env"
+        monkeypatch.syspath_prepend(str(env_root))
+
+        for module_name in [
+            "server",
+            "server.python_executor",
+            "server.repl_environment",
+        ]:
+            sys.modules.pop(module_name, None)
+
+        module = importlib.import_module("server.repl_environment")
+        assert hasattr(module, "REPLEnvironment")
+
+    def test_server_app_imports_from_env_root_without_path_rewrite(self):
+        """Importing server.app from env root should work without bundled-src hacks."""
+        env_root = Path(__file__).resolve().parents[2] / "envs" / "repl_env"
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                ".",
+                "python",
+                "-c",
+                (
+                    "import importlib; "
+                    "importlib.import_module('server.app'); "
+                    "print('ok')"
+                ),
+            ],
+            cwd=env_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        assert result.stdout.strip().splitlines()[-1] == "ok"
 
     def test_stderr_capture(self):
         """Test stderr is captured correctly via exception handling.
@@ -179,6 +224,32 @@ class TestREPLEnvironment:
         obs = env.step(REPLAction(code="print('FINAL(42)')"))
         assert obs.done
         assert obs.metadata["final_answer"] == "42"
+
+    @pytest.mark.parametrize(
+        "code, expected",
+        [
+            # Nested function calls inside FINAL(...).
+            ("print('FINAL(f(x))')", "f(x)"),
+            # Tuple as the final answer.
+            ("print('FINAL((1, 2, 3))')", "(1, 2, 3)"),
+            # Math expression with multiple nested parens (e2b_repl_example).
+            (
+                "print('FINAL(2^(2^(2^(2))) = 65536)')",
+                "2^(2^(2^(2))) = 65536",
+            ),
+            # Dict containing a tuple value.
+            ("print(\"FINAL({'a': (1, 2)})\")", "{'a': (1, 2)}"),
+            # Output after FINAL must not bleed into the extracted answer.
+            ("print('FINAL(42)\\nresult: (ok)')", "42"),
+        ],
+    )
+    def test_final_pattern_nested_parentheses(self, code, expected):
+        """FINAL(...) extraction must handle nested parentheses (rlm #75)."""
+        env = REPLEnvironment()
+        env.reset()
+        obs = env.step(REPLAction(code=code))
+        assert obs.done
+        assert obs.metadata["final_answer"] == expected
 
     def test_final_var_pattern(self):
         """Test FINAL_VAR() pattern."""
@@ -893,7 +964,7 @@ class TestREPLEnvRemoteClient:
                 return {"data": {}}
             raise AssertionError(f"Unexpected message type: {message['type']}")
 
-        monkeypatch.setattr(env.async_client, "connect", fake_connect)
+        monkeypatch.setattr(env.async_client, "_connect_async", fake_connect)
         monkeypatch.setattr(
             env.async_client, "_send_and_receive", fake_send_and_receive
         )

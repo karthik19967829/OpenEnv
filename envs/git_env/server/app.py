@@ -28,8 +28,17 @@ import os
 
 from openenv.core.env_server import create_app
 
-from ..models import GitAction, GitObservation
-from .git_task_environment import GitTaskEnvironment
+# Support both in-repo and standalone imports
+try:
+    # In-repo imports (when running from OpenEnv repository)
+    from ..models import GitAction, GitObservation, GitState
+    from .git_task_environment import GitTaskEnvironment
+except ImportError as e:
+    if "relative import" not in str(e) and "no known parent package" not in str(e):
+        raise
+    # Standalone imports (when running via uvicorn server.app:app)
+    from models import GitAction, GitObservation, GitState
+    from server.git_task_environment import GitTaskEnvironment
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +68,20 @@ def create_git_environment():
 
 # Create the app with web interface and README integration
 # Pass the factory function instead of an instance for WebSocket session support
-app = create_app(create_git_environment, GitAction, GitObservation, env_name="git_env")
+app = create_app(
+    create_git_environment,
+    GitAction,
+    GitObservation,
+    env_name="git_env",
+    state_cls=GitState,
+)
 
 
-if __name__ == "__main__":
+def main():
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+if __name__ == "__main__":
+    main()
