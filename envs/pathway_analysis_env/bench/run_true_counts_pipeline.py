@@ -149,7 +149,7 @@ def _fasterq_dump_one(s: Sample, *, out_dir: Path, threads_per_job: int) -> Tupl
     fq1 = out_dir / f"{s.sra}_1.fastq"
     fq2 = out_dir / f"{s.sra}_2.fastq"
     fq_single = out_dir / f"{s.sra}.fastq"
-    if not (fq1.exists() or fq_single.exists()):
+    if not (fq1.exists() or fq2.exists() or fq_single.exists()):
         _run(
             [
                 "fasterq-dump",
@@ -160,8 +160,13 @@ def _fasterq_dump_one(s: Sample, *, out_dir: Path, threads_per_job: int) -> Tupl
                 s.sra,
             ]
         )
-    if fq1.exists():
-        return s.sample_id, s.sra, (fq1, fq2 if fq2.exists() else None)
+    if fq1.exists() or fq2.exists():
+        if not (fq1.exists() and fq2.exists()):
+            raise RuntimeError(
+                f"Incomplete paired FASTQ for {s.sra}; restore both mates or "
+                "remove the partial files and rerun fasterq-dump."
+            )
+        return s.sample_id, s.sra, (fq1, fq2)
     if fq_single.exists():
         return s.sample_id, s.sra, (fq_single, None)
     raise RuntimeError(f"FASTQ not found after fasterq-dump for {s.sra}")

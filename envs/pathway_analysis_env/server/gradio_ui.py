@@ -303,8 +303,10 @@ def _response(
     state_md = _state_markdown(st if isinstance(st, dict) else {})
     conds = (st or {}).get("conditions") or []
     if update_contrast and conds:
-        ref_v = str(conds[0])
-        alt_v = str(conds[1]) if len(conds) > 1 else ref_v
+        design = (data.get("observation") or {}).get("experiment_design") or {}
+        contrast = design.get("default_contrast") or {}
+        ref_v = str(contrast.get("reference") or conds[0])
+        alt_v = str(contrast.get("alternate") or (conds[1] if len(conds) > 1 else conds[0]))
         cref, calt = gr.update(value=ref_v), gr.update(value=alt_v)
     else:
         cref, calt = gr.update(), gr.update()

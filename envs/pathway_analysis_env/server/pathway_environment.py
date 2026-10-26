@@ -108,7 +108,7 @@ def _safe_case_id(case: Dict[str, Any]) -> str:
     return str(cid or "unknown_case")
 
 
-class PathwayEnvironment(Environment):
+class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayState]):
     """
     Pathway inference with optional **pipeline Mode A** (counts + metadata in JSON),
     or **legacy** toy fixtures (static gene/pathway lists).
@@ -198,6 +198,7 @@ class PathwayEnvironment(Environment):
             message=msg
             + " Use understand_experiment_design, inspect, run DE, enrichment, compare, or submit.",
             available_conditions=self._state.conditions,
+            experiment_design=self._experiment_design_dict(),
             metadata={
                 "case_id": self._case["case_id"],
                 "pipeline_mode": pipeline,
@@ -490,9 +491,11 @@ class PathwayEnvironment(Environment):
         dc = self._case.get("default_contrast") or {}
         ar = (action.condition_a or "").strip()
         ab = (action.condition_b or "").strip()
-        ref = ar or self._state.validated_reference or dc.get("reference")
-        alt = ab or self._state.validated_alternate or dc.get("alternate")
-        return ref, alt
+        if ar or ab:
+            return ar or None, ab or None
+        if self._state.validated_reference or self._state.validated_alternate:
+            return self._state.validated_reference, self._state.validated_alternate
+        return dc.get("reference"), dc.get("alternate")
 
     def _step_de(self, action: PathwayAction) -> PathwayObservation:
         s = self._state
@@ -512,7 +515,7 @@ class PathwayEnvironment(Environment):
             obs.trace_path = self._refresh_trace_file()
             return obs
 
-        if not pydeseq2_available():
+        if "de_table_file" not in self._case and not pydeseq2_available():
             if s.strict_mode:
                 return self._fail_strict(
                     "PyDESeq2 is not installed; strict mode terminates.",
@@ -540,6 +543,26 @@ class PathwayEnvironment(Environment):
 
         sample_ids = self._case["sample_ids"]
         smd = self._case["sample_metadata"]
+        try:
+            meta_df = build_sample_metadata(sample_ids, smd)
+        except ValueError as exc:
+            if s.strict_mode:
+                return self._fail_strict(str(exc), FC.CASE_SAMPLE_METADATA_MISMATCH)
+            return PathwayObservation(
+                message=str(exc),
+                reward=-0.5,
+                metadata={"failure_code": FC.CASE_SAMPLE_METADATA_MISMATCH},
+            )
+
+        invalid = self._validate_contrast_proposal(ref, alt)
+        if invalid:
+            msg, code = invalid
+            if s.strict_mode:
+                return self._fail_strict(msg, code)
+            return PathwayObservation(
+                message=msg, reward=-0.3, metadata={"failure_code": code}
+            )
+
         try:
             if "de_table_file" in self._case:
                 # Author-provided DE (no counts available). We treat this as a precomputed DE run.
@@ -604,7 +627,6 @@ class PathwayEnvironment(Environment):
                 if v_err:
                     raise ValueError(v_err)
                 counts_df = counts_dict_to_samples_by_genes(counts, sample_ids)
-            meta_df = build_sample_metadata(sample_ids, smd)
         except ValueError as exc:
             if s.strict_mode:
                 return self._fail_strict(str(exc), FC.DE_INVALID_COUNTS_MATRIX)
@@ -850,9 +872,23 @@ class PathwayEnvironment(Environment):
                 p: self._case.get("top_genes", [])
                 for p in self._case.get("top_pathways", [])
             }
-        detail = compare_pathways_detail(
-            a, b, pathways, self._query_genes or list(self._case.get("top_genes", []))
-        )
+        query = self._query_genes or list(self._case.get("top_genes", []))
+        enrichr_support = bool(self._case.get("enrichr_libraries")) and not s.legacy_mode
+        if enrichr_support:
+            pathways = {r["pathway"]: r["overlap_genes"] for r in self._ora_rows}
+            # Enrichr returns query overlap, not full pathway membership.
+            query = [g for genes in pathways.values() for g in genes]
+        if a not in pathways or b not in pathways:
+            return PathwayObservation(
+                message="Both pathways must have definitions or completed enrichment hits.",
+                reward=-0.1,
+                metadata={"error": "unknown_pathway"},
+            )
+        detail = compare_pathways_detail(a, b, pathways, query)
+        if enrichr_support:
+            detail["pathway_a_size"] = None
+            detail["pathway_b_size"] = None
+            detail["comparison_scope"] = "enrichr_overlap_genes"
         self._trace("compare_pathways", detail, f"Compared {a} vs {b}")
         obs = PathwayObservation(
             message=f"Pathway comparison: {a} vs {b}.",

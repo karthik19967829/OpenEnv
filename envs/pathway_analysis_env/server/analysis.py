@@ -201,6 +201,13 @@ def validate_counts_case(case: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    if pd.isna(value):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
 def load_author_de_table_csv(
     path: str | Path,
     *,
@@ -255,18 +262,14 @@ def load_author_de_table_csv(
         gene = str(r.get(gene_column, "")).strip()
         if not gene or gene.lower() in ("nan", "none"):
             continue
-        padj = float(r.get(padj_column)) if pd.notna(r.get(padj_column)) else 1.0
+        padj = _safe_padj_value(r.get(padj_column))
         rows.append(
             {
                 "gene": gene,
-                "baseMean": float("nan"),  # unknown for author tables; kept for schema compat
-                "log2FoldChange": float(r.get(log2fc_column, 0.0))
-                if pd.notna(r.get(log2fc_column))
-                else 0.0,
+                "baseMean": None,  # unknown for author tables
+                "log2FoldChange": _finite_float_or_none(r.get(log2fc_column)),
                 "lfcSE": None,
-                "pvalue": float(r.get(pvalue_column, 1.0))
-                if pd.notna(r.get(pvalue_column))
-                else 1.0,
+                "pvalue": _finite_float_or_none(r.get(pvalue_column)),
                 "padj": padj,
                 "significant": False,  # filled by caller using chosen alpha
             }
@@ -326,23 +329,19 @@ def run_deseq2_contrast(
 
     de_rows: List[Dict[str, Any]] = []
     for gene, row in res.iterrows():
-        padj = float(row["padj"]) if pd.notna(row["padj"]) else 1.0
+        padj = _safe_padj_value(row["padj"])
         de_rows.append(
             {
                 "gene": str(gene),
-                "baseMean": float(row.get("baseMean", 0.0)),
-                "log2FoldChange": float(row.get("log2FoldChange", 0.0)),
-                "lfcSE": float(row.get("lfcSE", 0.0))
-                if pd.notna(row.get("lfcSE"))
-                else None,
-                "pvalue": float(row.get("pvalue", 1.0))
-                if pd.notna(row.get("pvalue"))
-                else 1.0,
+                "baseMean": _finite_float_or_none(row.get("baseMean")),
+                "log2FoldChange": _finite_float_or_none(row.get("log2FoldChange")),
+                "lfcSE": _finite_float_or_none(row.get("lfcSE")),
+                "pvalue": _finite_float_or_none(row.get("pvalue")),
                 "padj": padj,
                 "significant": padj <= padj_alpha,
             }
         )
-    de_rows.sort(key=lambda r: (r["padj"], -abs(r["log2FoldChange"])))
+    de_rows.sort(key=lambda r: (r["padj"], -abs(r["log2FoldChange"] or 0.0)))
     return de_rows, None
 
 
@@ -502,7 +501,7 @@ def _safe_padj_value(v: Any) -> float:
         x = float(v)
     except (TypeError, ValueError):
         return 1.0
-    return 1.0 if math.isnan(x) else x
+    return x if math.isfinite(x) else 1.0
 
 
 def pick_de_query_genes(
@@ -527,7 +526,7 @@ def pick_de_query_genes(
             lfc = float(r.get("log2FoldChange", 0.0))
         except (TypeError, ValueError):
             return False
-        if math.isnan(lfc):
+        if not math.isfinite(lfc):
             return False
         if dir_norm == "both":
             return abs(lfc) >= min_abs_log2fc
