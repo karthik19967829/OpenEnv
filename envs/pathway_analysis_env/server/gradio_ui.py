@@ -46,6 +46,21 @@ def _list_saved_runs() -> List[str]:
 
 def _load_saved_run(run_name: str) -> Dict[str, Any]:
     base = _OUTPUTS_DIR / run_name
+    root = _OUTPUTS_DIR.resolve()
+    files = (base / "summary.json", base / "de_top200.json", base / "enrichment_top50.json")
+    if (
+        not run_name
+        or run_name in {".", ".."}
+        or Path(run_name).name != run_name
+        or not all(path.resolve().is_relative_to(root) for path in files)
+    ):
+        return {
+            "run": run_name,
+            "summary_error": "Invalid run name",
+            "summary": {},
+            "de": [],
+            "enrichment": [],
+        }
     out: Dict[str, Any] = {"run": run_name}
     try:
         out["summary"] = json.loads((base / "summary.json").read_text(encoding="utf-8"))
