@@ -127,6 +127,22 @@ def test_compare_enrichr_support(env, monkeypatch):
     assert d["pathway_a_size"] is None  # hits do not give full pathway membership
     assert d["comparison_scope"] == "enrichr_overlap_genes"
 
+    from types import SimpleNamespace
+
+    from pathway_analysis_env.server import gradio_ui
+
+    outputs = gradio_ui._response(
+        {"observation": obs.model_dump()},
+        SimpleNamespace(get_state=lambda: env.state.model_dump()),
+        "Compare complete.",
+        update_contrast=False,
+    )
+    table = outputs[3]
+    assert table["count"].tolist() == [1, 1, 1, "Unknown"]
+    assert table["genes (preview)"].tolist()[:3] == ["A", "C", "B"]
+    assert "Enrichr overlap genes only" in outputs[0]
+    assert "full pathway membership is unknown" in outputs[0]
+
 
 def test_compare_unknown_pathways_does_not_reward(env):
     obs = env.step(

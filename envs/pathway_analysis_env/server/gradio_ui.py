@@ -129,6 +129,8 @@ def _pathway_comparison_df(obs: Dict[str, Any]) -> pd.DataFrame:
         )
     a = pc.get("pathway_a", "")
     b = pc.get("pathway_b", "")
+    a_size = pc.get("pathway_a_size")
+    b_size = pc.get("pathway_b_size")
     rows = [
         {
             "pathway": f"A only ({a})",
@@ -147,8 +149,13 @@ def _pathway_comparison_df(obs: Dict[str, Any]) -> pd.DataFrame:
         },
         {
             "pathway": "Pathway gene-set sizes",
-            "count": pc.get("pathway_a_size", 0) + pc.get("pathway_b_size", 0),
-            "genes (preview)": f"A size={pc.get('pathway_a_size')} · B size={pc.get('pathway_b_size')}",
+            "count": a_size + b_size
+            if a_size is not None and b_size is not None
+            else "Unknown",
+            "genes (preview)": (
+                f"A size={a_size if a_size is not None else 'Unknown'} · "
+                f"B size={b_size if b_size is not None else 'Unknown'}"
+            ),
         },
     ]
     return pd.DataFrame(rows)
@@ -210,6 +217,14 @@ def _observation_to_tables(
             "**Experiment design (structured):**\n```json\n"
             + json.dumps(ed, indent=2, default=str)[:8000]
             + "\n```"
+        )
+
+    comparison = obs.get("pathway_comparison") or {}
+    if comparison.get("comparison_scope") == "enrichr_overlap_genes":
+        lines.append(
+            "**Comparison scope:** Enrichr overlap genes only; "
+            "exclusive/shared support is relative to the returned query overlaps, "
+            "and full pathway membership is unknown."
         )
 
     md = "\n\n".join(lines)

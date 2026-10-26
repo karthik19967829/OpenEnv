@@ -111,3 +111,28 @@ def test_counts_like_reset_supplies_ui_contrast(monkeypatch):
     )
     assert outputs[-2]["value"] == "control"
     assert outputs[-1]["value"] == "FAR"
+
+
+@pytest.mark.parametrize("sizes", [(None, None), (None, 3), (2, None), (2, 3), (0, 0)])
+def test_comparison_ui_preserves_unknown_and_known_sizes(sizes):
+    a_size, b_size = sizes
+    comparison = analysis.compare_pathways_detail(
+        "P1", "P2", {"P1": ["A", "B"], "P2": ["B", "C"]}, ["A", "B", "C"]
+    )
+    comparison.update(pathway_a_size=a_size, pathway_b_size=b_size)
+    obs = PathwayObservation(pathway_comparison=comparison)
+    outputs = gradio_ui._response(
+        {"observation": obs.model_dump()},
+        SimpleNamespace(get_state=lambda: {}),
+        "Compare complete.",
+        update_contrast=False,
+    )
+    table = outputs[3]
+    assert table["count"].tolist()[:3] == [1, 1, 1]
+    assert table["genes (preview)"].tolist()[:3] == ["A", "C", "B"]
+    expected = "Unknown" if None in sizes else sum(sizes)
+    assert table.iloc[3]["count"] == expected
+    for label, size in zip(("A", "B"), sizes):
+        rendered = "Unknown" if size is None else str(size)
+        assert f"{label} size={rendered}" in table.iloc[3]["genes (preview)"]
+    assert json.loads(outputs[6])["observation"]["pathway_comparison"] == comparison
