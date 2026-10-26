@@ -40,3 +40,6 @@ server = "pathway_analysis_env.server.app:main"
 include-package-data = true
 packages = ["pathway_analysis_env", "pathway_analysis_env.server"]
 package-dir = { "pathway_analysis_env" = ".", "pathway_analysis_env.server" = "server" }
+
+[tool.setuptools.package-data]
+pathway_analysis_env = ["data/*.json"]

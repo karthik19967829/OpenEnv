@@ -24,7 +24,7 @@ if "MPLCONFIGDIR" not in os.environ:
 
 from openenv.core.env_server.http_server import create_app
 
-from ..models import PathwayAction, PathwayObservation
+from ..models import PathwayAction, PathwayObservation, PathwayState
 from .gradio_ui import build_pathway_gradio_app
 from .pathway_environment import PathwayEnvironment
 
@@ -44,7 +44,7 @@ else:
         "openenv-core does not support gradio_builder; Pathway lab tab will be unavailable."
     )
 
-app = create_app(**_kw)
+app = create_app(**_kw, state_cls=PathwayState)
 
 
 def main():
