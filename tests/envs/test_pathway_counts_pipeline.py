@@ -72,3 +72,96 @@ def test_single_fastq_does_not_mask_incomplete_pair(tmp_path, monkeypatch):
             out_dir=tmp_path,
             threads_per_job=1,
         )
+
+
+@pytest.mark.parametrize("paired", [False, True])
+def test_featurecounts_layout_flags(tmp_path, monkeypatch, paired):
+    output = tmp_path / "counts.txt"
+    calls = []
+
+    def run(cmd):
+        calls.append(cmd)
+        output.write_text("fixture")
+
+    monkeypatch.setattr(pipeline, "_run", run)
+    pipeline.quantify_featurecounts(
+        gtf=tmp_path / "genes.gtf",
+        bams={"b": tmp_path / "b.bam", "a": tmp_path / "a.bam"},
+        out_path=output,
+        threads=2,
+        paired_end=paired,
+    )
+    assert ("-p" in calls[0]) is paired
+    assert ("--countReadPairs" in calls[0]) is paired
+    assert calls[0][-2:] == [str(tmp_path / "a.bam"), str(tmp_path / "b.bam")]
+
+
+@pytest.mark.parametrize("layout", ["single", "paired", "mixed"])
+@pytest.mark.parametrize("parallelism", [1, 2])
+def test_star_main_preserves_fastq_layout(tmp_path, monkeypatch, layout, parallelism):
+    import json
+    import sys
+
+    samples = tmp_path / "samples.json"
+    samples.write_text(
+        json.dumps(
+            [
+                {"sample_id": sid, "sra": sid, "condition": "control"}
+                for sid in ("a", "b")
+            ]
+        )
+    )
+    index = tmp_path / "index"
+    index.mkdir()
+    (index / "genomeParameters.txt").touch()
+    fastqs = {
+        sid: (
+            tmp_path / f"{sid}_1.fastq",
+            tmp_path / f"{sid}_2.fastq"
+            if layout == "paired" or (layout == "mixed" and sid == "a")
+            else None,
+        )
+        for sid in ("a", "b")
+    }
+    monkeypatch.setattr(pipeline, "download_fastq", lambda *a, **k: fastqs)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pipeline",
+            "--samples-json",
+            str(samples),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--gtf",
+            str(tmp_path / "genes.gtf"),
+            "--star-index",
+            str(index),
+            "--quant-parallelism",
+            str(parallelism),
+        ],
+    )
+    calls = []
+
+    def align(*, sample_id, fastq2, **kwargs):
+        calls.append("align")
+        assert (fastq2 is not None) is (layout == "paired")
+        return tmp_path / f"{sample_id}.bam"
+
+    def run(cmd):
+        calls.append(cmd)
+        pipeline.Path(cmd[cmd.index("-o") + 1]).write_text("fixture")
+
+    monkeypatch.setattr(pipeline, "align_star", align)
+    monkeypatch.setattr(pipeline, "_run", run)
+    monkeypatch.setattr(
+        pipeline, "featurecounts_to_openenv_counts", lambda **kwargs: None
+    )
+    if layout == "mixed":
+        with pytest.raises(ValueError, match="uniform"):
+            pipeline.main()
+        assert calls == []
+    else:
+        pipeline.main()
+        assert ("-p" in calls[-1]) is (layout == "paired")
+        assert ("--countReadPairs" in calls[-1]) is (layout == "paired")

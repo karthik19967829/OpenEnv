@@ -16,16 +16,24 @@ See `server/pathway_environment.py` for where each code is set.
 | `de_missing_contrast` | Pipeline DE: no reference/alternate from action, validated design, or `default_contrast`. |
 | `de_pydeseq2_unavailable` | PyDESeq2 not installed (non-strict: recoverable; strict: episode ends). |
 | `de_deseq2_failed` | `run_deseq2_contrast` returned an error string. |
-| `de_invalid_counts_matrix` | `validate_counts_case` failed. |
+| `de_invalid_counts_matrix` | Counts validation or loading failed, including missing/unreadable matrix files. |
 | `de_too_few_genes_after_filter` | Prefilter leaves too few genes for stable DESeq2. |
 | `case_sample_metadata_mismatch` | `build_sample_metadata` raised (e.g. sample id missing from metadata). |
 | `ora_de_prerequisite` | Pipeline ORA before DE has been run. |
-| `ora_no_pathway_definitions` | Case has no `pathway_genes` for ORA. |
+| `ora_no_pathway_definitions` | Case has neither `pathway_genes` nor `enrichr_libraries` for ORA. |
 | `compare_missing_pathway_names` | `compare_pathways` without both `pathway_a` and `pathway_b`. |
 | `expert_disabled` | `expert_budget` is 0. |
 | `expert_budget_exhausted` | Expert calls used ≥ budget. |
 | `submit_incorrect_hypothesis` | `submit_answer` with wrong pathway (analytics; optional). |
 | `strict_termination` | Strict mode ended the episode; prefer the specific code above when also set. |
+
+## Precomputed tables and external enrichment
+
+- `de_unsupported_precomputed_contrast`: `_step_de` rejected a requested or validated pair other than the case's `default_contrast` for an author DE table. Tables are loaded unchanged only for that configured pair; reverse and other contrasts require refitting from counts and are unsupported. A default pair must be configured. This restriction does not validate the source table's contrast provenance or sign convention; case authors must verify them.
+- `ora_gseapy_unavailable`: `_step_enrichment` cannot import the Enrichr dependency.
+- `ora_enrichr_failed`: `_step_enrichment` received an Enrichr error (including service/network failures).
+
+These failures terminate strict episodes and return recoverable negative-reward observations otherwise. Author DE observations include at most 200 rows, while the full table remains available internally for analysis.
 
 ## Strict mode
 

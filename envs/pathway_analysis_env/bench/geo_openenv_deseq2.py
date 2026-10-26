@@ -59,6 +59,7 @@ def main() -> None:
     from pathway_analysis_env.server.analysis import (
         build_sample_metadata,
         enrichr_ora,
+        filter_counts_by_minimum_total,
         load_counts_csv_as_samples_by_genes,
         merge_analysis_options,
         pick_de_query_genes,
@@ -71,6 +72,14 @@ def main() -> None:
         Path("data") / case["counts_file"],
         sample_ids=case["sample_ids"],
     )
+    counts_df, n_genes_in, n_genes_filt = filter_counts_by_minimum_total(
+        counts_df, int(opts["min_total_count"])
+    )
+    if n_genes_filt < 5:
+        raise RuntimeError(
+            f"After min_total_count={opts['min_total_count']} prefilter, "
+            f"only {n_genes_filt} genes remain (need ≥5 for stable DESeq2)."
+        )
     meta_df = build_sample_metadata(case["sample_ids"], case["sample_metadata"])
     ref = case["default_contrast"]["reference"]
     alt = case["default_contrast"]["alternate"]
@@ -101,7 +110,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         **extra,
-        "genes_in_matrix": int(counts_df.shape[1]),
+        "genes_in_matrix": n_genes_in,
+        "genes_after_prefilter": n_genes_filt,
         "n_de_rows_returned": len(rows),
         "n_sig_padj_0.05": sum(1 for r in rows if r.get("significant")),
         "enrichr_error": oerr,

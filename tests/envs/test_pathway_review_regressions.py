@@ -152,3 +152,79 @@ def test_compare_unknown_pathways_does_not_reward(env):
     )
     assert obs.reward < 0
     assert obs.pathway_comparison is None
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_missing_counts_file_is_failure(env, tmp_path, strict):
+    env._case["counts_file"] = str(tmp_path / "missing.csv.gz")
+    env._state.strict_mode = strict
+    obs = env.step(PathwayAction(action_type="run_differential_expression"))
+    assert obs.metadata["failure_code"] == "de_invalid_counts_matrix"
+    assert obs.done is strict
+    assert not env.state.de_run
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_author_table_rejects_reversed_contrast(env, tmp_path, strict):
+    table = tmp_path / "author.csv"
+    table.write_text("Gene,name;log2FoldChange;pvalue;padj\nTP53;2;0.001;0.01\n")
+    env._case["de_table_file"] = str(table)
+    env._state.strict_mode = strict
+    obs = env.step(
+        PathwayAction(
+            action_type="run_differential_expression",
+            condition_a="treated",
+            condition_b="control",
+        )
+    )
+    assert obs.metadata["failure_code"] == "de_unsupported_precomputed_contrast"
+    assert obs.done is strict
+    assert not env.state.de_run
+    assert not obs.de_genes
+
+
+def test_author_table_caps_observation_but_keeps_analysis_rows(env, tmp_path):
+    table = tmp_path / "author.csv"
+    table.write_text(
+        "Gene,name;log2FoldChange;pvalue;padj\n"
+        + "".join(f"G{i};2;0.001;0.01\n" for i in range(251))
+    )
+    env._case["de_table_file"] = str(table)
+    obs = env.step(PathwayAction(action_type="run_differential_expression"))
+    assert len(obs.de_genes) == 200
+    assert len(env._de_rows) == 251
+    assert len(env._query_genes) == 200  # existing query selection cap
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("failure", ["missing", "runtime", "definitions"])
+def test_enrichment_failure_codes(env, monkeypatch, strict, failure):
+    env._state.strict_mode = strict
+    env._case.pop("pathway_genes")
+    env._case["enrichr_libraries"] = [] if failure == "definitions" else ["mock"]
+    env._de_rows = [{"gene": "TP53", "padj": 0.01, "log2FoldChange": 2}]
+    monkeypatch.setattr(pe, "gseapy_available", lambda: failure != "missing")
+    monkeypatch.setattr(pe, "enrichr_ora", lambda *a, **k: ([], "service failed"))
+    obs = env.step(PathwayAction(action_type="run_pathway_enrichment"))
+    assert (
+        obs.metadata["failure_code"]
+        == {
+            "missing": "ora_gseapy_unavailable",
+            "runtime": "ora_enrichr_failed",
+            "definitions": "ora_no_pathway_definitions",
+        }[failure]
+    )
+    assert obs.done is strict
+    assert not env.state.enrichment_run
+
+
+@pytest.mark.parametrize("mode", ["validated_reverse", "missing_default"])
+def test_author_table_rejects_unsupported_implicit_contrast(env, mode):
+    env._case["de_table_file"] = "unused.csv"
+    env._state.validated_reference = "treated"
+    env._state.validated_alternate = "control"
+    if mode == "missing_default":
+        env._case.pop("default_contrast")
+    obs = env.step(PathwayAction(action_type="run_differential_expression"))
+    assert obs.metadata["failure_code"] == "de_unsupported_precomputed_contrast"
+    assert not env.state.de_run

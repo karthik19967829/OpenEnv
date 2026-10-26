@@ -54,7 +54,7 @@ RUN micromamba create -y -n rnaseq -c conda-forge -c bioconda \
     fastqc \
     multiqc \
     samtools \
-    subread \
+    "subread>=2.0.2" \
     star \
     salmon \
     && micromamba clean -a -y

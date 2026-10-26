@@ -23,9 +23,14 @@ DE_INVALID_COUNTS_MATRIX = "de_invalid_counts_matrix"
 DE_TOO_FEW_GENES_AFTER_FILTER = "de_too_few_genes_after_filter"
 CASE_SAMPLE_METADATA_MISMATCH = "case_sample_metadata_mismatch"
 
+DE_UNSUPPORTED_PRECOMPUTED_CONTRAST = "de_unsupported_precomputed_contrast"
+
 # run_pathway_enrichment
 ORA_DE_PREREQUISITE = "ora_de_prerequisite"
 ORA_NO_PATHWAY_DEFINITIONS = "ora_no_pathway_definitions"
+
+ORA_GSEAPY_UNAVAILABLE = "ora_gseapy_unavailable"
+ORA_ENRICHR_FAILED = "ora_enrichr_failed"
 
 # compare_pathways
 COMPARE_MISSING_PATHWAY_NAMES = "compare_missing_pathway_names"

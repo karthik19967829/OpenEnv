@@ -408,6 +408,7 @@ def quantify_featurecounts(
     bams: Dict[str, Path],
     out_path: Path,
     threads: int,
+    paired_end: bool,
 ) -> Path:
     """
     Run featureCounts on all BAMs and return the raw featureCounts output path.
@@ -424,7 +425,10 @@ def quantify_featurecounts(
         str(out_path),
         "-g",
         "gene_id",
-    ] + [str(p) for p in bam_paths]
+    ]
+    if paired_end:
+        cmd += ["-p", "--countReadPairs"]
+    cmd += [str(p) for p in bam_paths]
     _run(cmd)
     if not out_path.exists():
         raise RuntimeError(f"featureCounts did not write {out_path}")
@@ -618,7 +622,13 @@ def main() -> None:
         print("[DONE] counts:", counts_out)
         return
 
-    # STAR + featureCounts
+    # STAR + featureCounts (Subread >=2.0.2).
+    layouts = {fastqs[s.sample_id][1] is not None for s in samples}
+    if len(layouts) != 1:
+        raise ValueError(
+            "STAR featureCounts requires a uniform single-end or paired-end batch."
+        )
+    paired_end = layouts.pop()
     if args.gtf is None:
         raise SystemExit("--gtf is required for --method star")
 
@@ -669,7 +679,13 @@ def main() -> None:
         bams = {s.sample_id: bams[s.sample_id] for s in samples}
 
     fc_out = out_dir / "featureCounts.txt"
-    quantify_featurecounts(gtf=args.gtf, bams=bams, out_path=fc_out, threads=int(args.threads))
+    quantify_featurecounts(
+        gtf=args.gtf,
+        bams=bams,
+        out_path=fc_out,
+        threads=int(args.threads),
+        paired_end=paired_end,
+    )
 
     counts_out = args.counts_csv_gz or (out_dir / "openenv_counts.csv.gz")
     # featureCounts sample column order matches sorted BAM list in quantify_featurecounts

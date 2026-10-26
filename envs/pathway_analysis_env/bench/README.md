@@ -112,3 +112,11 @@ PYTHONPATH=src:envs uv run python envs/pathway_analysis_env/bench/run_study4_gse
 PYTHONPATH=src:envs uv run python envs/pathway_analysis_env/bench/run_study5_gse216540_end_to_end.py
 ```
 
+
+### Counting and filtering contract
+
+The STAR path requires Subread **2.0.2 or newer** (also enforced by the benchmark image's package constraint). Paired FASTQs use `featureCounts -p --countReadPairs` to count fragments; single-end FASTQs use neither flag. Mixed single/paired batches are rejected before alignment. See the [Subread release notes](https://subread.sourceforge.net/) and [user guide](https://subread.sourceforge.net/SubreadUsersGuide.pdf). Earlier versions gave `-p` different semantics and are unsupported here.
+
+The GEO DE runner applies the case's `min_total_count` filter before fitting and uses the retained genes for its ORA background, matching the environment. Fewer than five retained genes aborts analysis. Summaries distinguish `genes_in_matrix` from `genes_after_prefilter`.
+
+Gene identifiers remain the annotation's `gene_id`; no Ensembl-to-symbol mapping is implied. Annotation provenance, identifier mapping, strandedness, and biological validation remain study-specific responsibilities.

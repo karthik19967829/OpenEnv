@@ -565,7 +565,24 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
 
         try:
             if "de_table_file" in self._case:
-                # Author-provided DE (no counts available). We treat this as a precomputed DE run.
+                # Precomputed tables only support the case's configured default pair.
+                dc = self._case.get("default_contrast") or {}
+                if (ref, alt) != (dc.get("reference"), dc.get("alternate")):
+                    msg = (
+                        "Author DE tables only support the configured default_contrast; "
+                        "no reversal or refitting is available."
+                    )
+                    if s.strict_mode:
+                        return self._fail_strict(
+                            msg, FC.DE_UNSUPPORTED_PRECOMPUTED_CONTRAST
+                        )
+                    return PathwayObservation(
+                        message=msg,
+                        reward=-0.3,
+                        metadata={
+                            "failure_code": FC.DE_UNSUPPORTED_PRECOMPUTED_CONTRAST
+                        },
+                    )
                 opts = merge_analysis_options(self._case)
                 de_rows = load_author_de_table_csv(
                     DATA_DIR / str(self._case["de_table_file"]),
@@ -605,7 +622,7 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
                 obs = PathwayObservation(
                     message="Differential expression loaded from author table.",
                     top_genes=top_names,
-                    de_genes=self._de_rows,
+                    de_genes=self._de_rows[:200],
                     reward=0.25,
                     metadata={
                         "step_count": s.step_count,
@@ -627,7 +644,7 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
                 if v_err:
                     raise ValueError(v_err)
                 counts_df = counts_dict_to_samples_by_genes(counts, sample_ids)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             if s.strict_mode:
                 return self._fail_strict(str(exc), FC.DE_INVALID_COUNTS_MATRIX)
             return PathwayObservation(
@@ -785,13 +802,13 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
             if not gseapy_available():
                 msg = "gseapy not installed; cannot run Enrichr enrichment."
                 if s.strict_mode:
-                    return self._fail_strict(msg, FC.ORA_NO_PATHWAY_DEFINITIONS)
+                    return self._fail_strict(msg, FC.ORA_GSEAPY_UNAVAILABLE)
                 return PathwayObservation(
                     message=msg,
                     reward=-0.3,
                     metadata={
                         "error": "missing_gseapy",
-                        "failure_code": FC.ORA_NO_PATHWAY_DEFINITIONS,
+                        "failure_code": FC.ORA_GSEAPY_UNAVAILABLE,
                     },
                 )
             ora, err = enrichr_ora(
@@ -802,13 +819,13 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
             )
             if err:
                 if s.strict_mode:
-                    return self._fail_strict(err, FC.ORA_NO_PATHWAY_DEFINITIONS)
+                    return self._fail_strict(err, FC.ORA_ENRICHR_FAILED)
                 return PathwayObservation(
                     message=err,
                     reward=-0.3,
                     metadata={
                         "error": "enrichr_failed",
-                        "failure_code": FC.ORA_NO_PATHWAY_DEFINITIONS,
+                        "failure_code": FC.ORA_ENRICHR_FAILED,
                     },
                 )
         else:
