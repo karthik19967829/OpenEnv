@@ -3,7 +3,6 @@
 import json
 
 import pytest
-
 from pathway_analysis_env.server import gradio_ui
 
 

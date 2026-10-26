@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from pathway_analysis_env.models import PathwayAction
 from pathway_analysis_env.server.analysis import (
     adjust_pvalues_bh,
@@ -24,8 +23,8 @@ from pathway_analysis_env.server.analysis import (
 )
 from pathway_analysis_env.server.pathway_environment import (
     DATA_DIR,
-    PathwayEnvironment,
     load_case,
+    PathwayEnvironment,
 )
 
 requires_pydeseq2 = pytest.mark.skipif(
@@ -150,7 +149,9 @@ def test_understand_validated_contrast_matches_explicit_de():
     )
     b = env2.step(PathwayAction(action_type="run_differential_expression"))
     assert a.de_genes and b.de_genes
-    assert [r.get("gene") for r in a.de_genes[:10]] == [r.get("gene") for r in b.de_genes[:10]]
+    assert [r.get("gene") for r in a.de_genes[:10]] == [
+        r.get("gene") for r in b.de_genes[:10]
+    ]
 
 
 def test_no_step_after_episode_done():
