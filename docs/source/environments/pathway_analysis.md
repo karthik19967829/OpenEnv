@@ -31,7 +31,7 @@ Observations include rich DE rows (`log2FoldChange`, `padj`), ORA tables, overla
 
 **Strict mode** (`strict_mode` in JSON or `reset(strict=True)`): invalid contrasts or missing PyDESeq2 end the episode with a failure signal instead of silent fallback.
 
-Stable machine-readable error labels: see **[docs/FAILURE_CODES.md](https://github.com/huggingface/OpenEnv/blob/main/envs/pathway_analysis_env/docs/FAILURE_CODES.md)** (`metadata["failure_code"]`).
+Stable machine-readable error labels: see **[docs/FAILURE_CODES.md](https://github.com/openenv/OpenEnv/blob/main/envs/pathway_analysis_env/docs/FAILURE_CODES.md)** (`metadata["failure_code"]`).
 
 ## Scripts
 
@@ -85,7 +85,7 @@ The Gradio UI (**Playground** + **Pathway lab**) is **on by default** for this a
 
 Open **http://localhost:8000/web/** — use the **Visualization** tab (**Pathway lab**) for the guided workflow.
 
-**Step-by-step UI guide:** [docs/USER_GUIDE_UI.md](https://github.com/huggingface/OpenEnv/blob/main/envs/pathway_analysis_env/docs/USER_GUIDE_UI.md) (what each button does, results panels, first-run example).
+**Step-by-step UI guide:** [docs/USER_GUIDE_UI.md](https://github.com/openenv/OpenEnv/blob/main/envs/pathway_analysis_env/docs/USER_GUIDE_UI.md) (what each button does, results panels, first-run example).
 
 ### Connect via client
 
