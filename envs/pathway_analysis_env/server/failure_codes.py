@@ -20,6 +20,7 @@ DE_MISSING_CONTRAST = "de_missing_contrast"
 DE_PYDESeq2_UNAVAILABLE = "de_pydeseq2_unavailable"
 DE_DESEQ2_FAILED = "de_deseq2_failed"
 DE_INVALID_COUNTS_MATRIX = "de_invalid_counts_matrix"
+DE_INVALID_AUTHOR_TABLE = "de_invalid_author_table"
 DE_TOO_FEW_GENES_AFTER_FILTER = "de_too_few_genes_after_filter"
 CASE_SAMPLE_METADATA_MISMATCH = "case_sample_metadata_mismatch"
 

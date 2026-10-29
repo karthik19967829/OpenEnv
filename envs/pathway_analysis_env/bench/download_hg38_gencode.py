@@ -18,9 +18,11 @@ It writes into an output directory and prints the resulting paths.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
-import os
 import subprocess
+import tempfile
+import zlib
 from pathlib import Path
 
 
@@ -34,6 +36,53 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _validate_gzip(path: Path) -> None:
+    """Read through EOF to verify gzip CRC/trailer without holding a genome in RAM."""
+    with gzip.open(path, "rb") as stream:
+        if not stream.read(1):
+            raise ValueError(f"Empty reference: {path}")
+        while stream.read(1024 * 1024):
+            pass
+
+
+def _download_reference(url: str, path: Path) -> None:
+    if path.exists():
+        try:
+            _validate_gzip(path)
+        except (OSError, EOFError, ValueError, zlib.error) as exc:
+            raise ValueError(
+                f"Invalid cached reference {path}; move this file aside or remove "
+                "it explicitly before rerunning. Other files are preserved."
+            ) from exc
+        return
+
+    # Use the destination filesystem so replacement is atomic. Only this run's
+    # temporary file is removed on failure; never publish HTTP bodies/partials.
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".part", delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+    try:
+        _run(
+            [
+                "curl",
+                "-L",
+                "--fail",
+                "--retry",
+                "5",
+                "--retry-delay",
+                "2",
+                "-o",
+                str(temporary),
+                url,
+            ]
+        )
+        _validate_gzip(temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -64,12 +113,8 @@ def main() -> None:
     gtf_path = out_dir / f"gencode.v{rel}.annotation.gtf.gz"
     tx_path = out_dir / f"gencode.v{rel}.transcripts.fa.gz"
 
-    if not fasta_path.exists():
-        _run(["curl", "-L", "-o", str(fasta_path), fasta_url])
-    if not gtf_path.exists():
-        _run(["curl", "-L", "-o", str(gtf_path), gtf_url])
-    if not tx_path.exists():
-        _run(["curl", "-L", "-o", str(tx_path), tx_url])
+    for url, path in ((fasta_url, fasta_path), (gtf_url, gtf_path), (tx_url, tx_path)):
+        _download_reference(url, path)
 
     print("[OK] FASTA:", fasta_path)
     print("[OK]  GTF:", gtf_path)
@@ -81,7 +126,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Make curl retries a bit more robust if user sets it.
-    os.environ.setdefault("CURL_RETRY", "5")
     main()
-

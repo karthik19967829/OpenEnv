@@ -165,3 +165,28 @@ def test_star_main_preserves_fastq_layout(tmp_path, monkeypatch, layout, paralle
         pipeline.main()
         assert ("-p" in calls[-1]) is (layout == "paired")
         assert ("--countReadPairs" in calls[-1]) is (layout == "paired")
+
+
+def test_plain_and_gzip_gtf_produce_identical_gene_maps(tmp_path):
+    import gzip
+
+    text = (
+        "# annotation\n"
+        'chr1\ttest\ttranscript\t1\t20\t.\t+\t.\tgene_id "G1"; transcript_id "T1"; gene_name "ABC";\n'
+        'chr1\ttest\texon\t1\t10\t.\t+\t.\tgene_id "G1"; transcript_id "T1"; gene_name "ABC";\n'
+        'chr1\ttest\texon\t30\t40\t.\t+\t.\tgene_id "G2"; transcript_id "T2";\n'
+    )
+    plain = tmp_path / "genes.gtf"
+    plain.write_text(text)
+    compressed = tmp_path / "genes.gtf.gz"
+    compressed.write_bytes(gzip.compress(text.encode()))
+    outputs = []
+    for i, source in enumerate((plain, compressed)):
+        # Both STAR's input preparation and Salmon's mapping accept either form.
+        star_input = pipeline._maybe_decompress_to(source, out_dir=tmp_path / "star")
+        assert star_input.read_text() == text
+        result = pipeline.build_tx2gene_from_gtf(
+            gtf_gz=source, out_tsv=tmp_path / f"map{i}.tsv"
+        )
+        outputs.append(result.read_text())
+    assert outputs == ["T1\tABC\nT2\tG2\n"] * 2

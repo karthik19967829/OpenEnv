@@ -228,3 +228,41 @@ def test_author_table_rejects_unsupported_implicit_contrast(env, mode):
     obs = env.step(PathwayAction(action_type="run_differential_expression"))
     assert obs.metadata["failure_code"] == "de_unsupported_precomputed_contrast"
     assert not env.state.de_run
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("source", ["author", "counts"])
+@pytest.mark.parametrize("failure", ["missing", "unreadable", "invalid"])
+def test_de_source_failures_have_distinct_codes(
+    env, tmp_path, monkeypatch, strict, source, failure
+):
+    path = tmp_path / "input.csv"
+    if failure == "unreadable":
+        from pathway_analysis_env.server import analysis
+
+        path.write_text("unreadable fixture")
+
+        def denied(*args, **kwargs):
+            raise PermissionError(f"Cannot read {path}")
+
+        # Exercise the actual loaders with a deterministic read failure, even as root.
+        monkeypatch.setattr(analysis.pd, "read_csv", denied)
+    elif failure == "invalid":
+        path.write_text("wrong,columns\nfoo,bar\n")
+    env._case[f"{'de_table' if source == 'author' else 'counts'}_file"] = str(path)
+    env._state.strict_mode = strict
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("failed source must not fall back to fitting counts")
+
+    monkeypatch.setattr(pe, "run_deseq2_contrast", unexpected)
+    obs = env.step(PathwayAction(action_type="run_differential_expression"))
+    expected = (
+        "de_invalid_author_table" if source == "author" else "de_invalid_counts_matrix"
+    )
+    assert obs.metadata["failure_code"] == expected
+    assert obs.reward < 0
+    assert obs.done is strict
+    assert obs.metadata.get("strict_failure", False) is strict
+    assert not env.state.de_run
+    assert not obs.de_genes

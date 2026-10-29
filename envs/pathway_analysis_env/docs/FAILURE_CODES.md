@@ -17,6 +17,7 @@ See `server/pathway_environment.py` for where each code is set.
 | `de_pydeseq2_unavailable` | PyDESeq2 not installed (non-strict: recoverable; strict: episode ends). |
 | `de_deseq2_failed` | `run_deseq2_contrast` returned an error string. |
 | `de_invalid_counts_matrix` | Counts validation or loading failed, including missing/unreadable matrix files. |
+| `de_invalid_author_table` | Author DE table loading or validation failed, including missing/unreadable files. |
 | `de_too_few_genes_after_filter` | Prefilter leaves too few genes for stable DESeq2. |
 | `case_sample_metadata_mismatch` | `build_sample_metadata` raised (e.g. sample id missing from metadata). |
 | `ora_de_prerequisite` | Pipeline ORA before DE has been run. |
@@ -29,6 +30,7 @@ See `server/pathway_environment.py` for where each code is set.
 
 ## Precomputed tables and external enrichment
 
+- `de_invalid_author_table`: author table loading failed; no fallback to counts or refitting is attempted, even when counts are present. Counts input failures retain `de_invalid_counts_matrix`.
 - `de_unsupported_precomputed_contrast`: `_step_de` rejected a requested or validated pair other than the case's `default_contrast` for an author DE table. Tables are loaded unchanged only for that configured pair; reverse and other contrasts require refitting from counts and are unsupported. A default pair must be configured. This restriction does not validate the source table's contrast provenance or sign convention; case authors must verify them.
 - `ora_gseapy_unavailable`: `_step_enrichment` cannot import the Enrichr dependency.
 - `ora_enrichr_failed`: `_step_enrichment` received an Enrichr error (including service/network failures).
@@ -51,7 +53,8 @@ When **`strict_mode`** ends an episode, observations include **`metadata["strict
 | `de_missing_contrast` | `_step_de` (no ref/alt) |
 | `de_pydeseq2_unavailable` | `_step_de` |
 | `de_deseq2_failed` | `_step_de` after `run_deseq2_contrast` error |
-| `de_invalid_counts_matrix` | `_step_de` after `validate_counts_case` |
+| `de_invalid_counts_matrix` | `_step_de` counts loading or `validate_counts_case` |
+| `de_invalid_author_table` | `_step_de` author-table loading/validation |
 | `de_too_few_genes_after_filter` | `_step_de` after prefilter |
 | `case_sample_metadata_mismatch` | `_step_de` `build_sample_metadata` `ValueError` |
 | `ora_de_prerequisite` | `_step_enrichment` (no DE rows, pipeline) |

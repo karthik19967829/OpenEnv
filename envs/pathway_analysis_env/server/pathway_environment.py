@@ -563,8 +563,8 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
                 message=msg, reward=-0.3, metadata={"failure_code": code}
             )
 
-        try:
-            if "de_table_file" in self._case:
+        if "de_table_file" in self._case:
+            try:
                 # Precomputed tables only support the case's configured default pair.
                 dc = self._case.get("default_contrast") or {}
                 if (ref, alt) != (dc.get("reference"), dc.get("alternate")):
@@ -586,9 +586,15 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
                 opts = merge_analysis_options(self._case)
                 de_rows = load_author_de_table_csv(
                     DATA_DIR / str(self._case["de_table_file"]),
-                    gene_column=str(self._case.get("de_table_gene_column") or "Gene,name"),
-                    log2fc_column=str(self._case.get("de_table_log2fc_column") or "log2FoldChange"),
-                    pvalue_column=str(self._case.get("de_table_pvalue_column") or "pvalue"),
+                    gene_column=str(
+                        self._case.get("de_table_gene_column") or "Gene,name"
+                    ),
+                    log2fc_column=str(
+                        self._case.get("de_table_log2fc_column") or "log2FoldChange"
+                    ),
+                    pvalue_column=str(
+                        self._case.get("de_table_pvalue_column") or "pvalue"
+                    ),
                     padj_column=str(self._case.get("de_table_padj_column") or "padj"),
                 )
                 padj_alpha = float(opts["padj_alpha"])
@@ -633,6 +639,19 @@ class PathwayEnvironment(Environment[PathwayAction, PathwayObservation, PathwayS
                 obs.trace_path = self._refresh_trace_file()
                 return obs
 
+            except (ValueError, OSError) as exc:
+                if s.strict_mode:
+                    return self._fail_strict(str(exc), FC.DE_INVALID_AUTHOR_TABLE)
+                return PathwayObservation(
+                    message=str(exc),
+                    reward=-0.5,
+                    metadata={
+                        "error": "author_table_invalid",
+                        "failure_code": FC.DE_INVALID_AUTHOR_TABLE,
+                    },
+                )
+
+        try:
             if "counts_file" in self._case:
                 counts_df = load_counts_csv_as_samples_by_genes(
                     DATA_DIR / str(self._case["counts_file"]),

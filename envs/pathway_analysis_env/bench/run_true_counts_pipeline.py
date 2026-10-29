@@ -98,7 +98,7 @@ def parse_samples_json(path: Path) -> List[Sample]:
 
 def build_tx2gene_from_gtf(*, gtf_gz: Path, out_tsv: Path) -> Path:
     """
-    Build a transcript→gene mapping for Salmon `--geneMap`.
+    Build a transcript→gene mapping for Salmon `--geneMap` from plain or gzip GTF.
 
     Output format (TSV):
       transcript_id <tab> gene_name
@@ -115,9 +115,11 @@ def build_tx2gene_from_gtf(*, gtf_gz: Path, out_tsv: Path) -> Path:
     re_gid = re.compile(r'gene_id "([^"]+)"')
 
     seen = set()
-    with gzip.open(gtf_gz, "rt", encoding="utf-8", errors="replace") as f, out_tsv.open(
-        "w", encoding="utf-8"
-    ) as out:
+    opener = gzip.open if str(gtf_gz).endswith(".gz") else open
+    with (
+        opener(gtf_gz, "rt", encoding="utf-8", errors="replace") as f,
+        out_tsv.open("w", encoding="utf-8") as out,
+    ):
         for line in f:
             if not line or line.startswith("#"):
                 continue
@@ -136,7 +138,9 @@ def build_tx2gene_from_gtf(*, gtf_gz: Path, out_tsv: Path) -> Path:
                 continue
             m_gn = re_gn.search(attrs)
             m_gid = re_gid.search(attrs)
-            gene = (m_gn.group(1) if m_gn else None) or (m_gid.group(1) if m_gid else None)
+            gene = (m_gn.group(1) if m_gn else None) or (
+                m_gid.group(1) if m_gid else None
+            )
             if not gene:
                 continue
             out.write(f"{tid}\t{gene}\n")
@@ -144,7 +148,9 @@ def build_tx2gene_from_gtf(*, gtf_gz: Path, out_tsv: Path) -> Path:
     return out_tsv
 
 
-def _fasterq_dump_one(s: Sample, *, out_dir: Path, threads_per_job: int) -> Tuple[str, str, Tuple[Path, Optional[Path]]]:
+def _fasterq_dump_one(
+    s: Sample, *, out_dir: Path, threads_per_job: int
+) -> Tuple[str, str, Tuple[Path, Optional[Path]]]:
     """Run fasterq-dump for one SRR if outputs are missing; return (sample_id, sra, (fq1, fq2_or_none))."""
     fq1 = out_dir / f"{s.sra}_1.fastq"
     fq2 = out_dir / f"{s.sra}_2.fastq"

@@ -60,6 +60,8 @@ For maximum credibility, match the common “hg38/GRCh38 + GENCODE annotation”
 python envs/pathway_analysis_env/bench/download_hg38_gencode.py --out-dir /work/ref/hg38_gencode_v47
 ```
 
+The downloader retries HTTP failures and validates the full gzip stream before atomically publishing each reference. Valid cached files are reused without downloading. An invalid cached file stops the run and is preserved: move aside or explicitly remove only the file named in the error before rerunning. Temporary downloads from the current run are cleaned up on failure. The pipeline accepts both plain `.gtf` and compressed `.gtf.gz` annotations for STAR and Salmon.
+
 This writes:
 - `GRCh38.primary_assembly.genome.fa.gz` (FASTA)
 - `gencode.v47.annotation.gtf.gz` (GTF)
